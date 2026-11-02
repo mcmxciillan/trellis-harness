@@ -1,0 +1,10 @@
+{
+  "name": "Trellis — AI Harness (Structure for intelligence)",
+  "short_name": "Trellis",
+  "description": "Cultivated scaffolding for complex AI workflows — Antigravity, Jev System-1, Claude, Codex, Copilot, DeepSeek, and Kimi with 3-Stage Council Voting.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F7F4EB",
+  "theme_color": "#A8202A",
+  "orientation": "any"
+}

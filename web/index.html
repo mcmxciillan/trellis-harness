@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#F7F4EB">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
+  <title>Trellis — AI Harness (Structure for intelligence)</title>
+  <link rel="stylesheet" href="/styles.css?v=20261102i">
+</head>
+<body>
+  <div id="app-shell" class="app-shell left-collapsed">
+    <!-- Top Telemetry Bar -->
+    <header class="topbar">
+      <div class="brand-group">
+        <div class="brand-lockup" title="Trellis — Structure for intelligence">
+          <svg class="brand-mark-svg" width="28" height="28" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="25" height="25" rx="6" fill="#F7F4EB" stroke="#262420" stroke-width="1.5"/>
+            <!-- Wireframe Lattice Grid -->
+            <line x1="6" y1="9" x2="22" y2="9" stroke="#7D796F" stroke-width="0.8" stroke-opacity="0.55"/>
+            <line x1="5" y1="15" x2="23" y2="15" stroke="#7D796F" stroke-width="0.8" stroke-opacity="0.55"/>
+            <line x1="7" y1="21" x2="21" y2="21" stroke="#7D796F" stroke-width="0.8" stroke-opacity="0.55"/>
+            <!-- Symmetrical Espalier Trunk & Horizontal Tiers -->
+            <path d="M14 24V5M7 15H21M9 9H19" stroke="#2D4A3E" stroke-width="1.9" stroke-linecap="round"/>
+            <!-- Pomegranate Crimson Fruit Nodes -->
+            <circle cx="14" cy="5.5" r="2.3" fill="#A8202A"/>
+            <circle cx="7" cy="15" r="2.2" fill="#A8202A"/>
+            <circle cx="21" cy="15" r="2.2" fill="#A8202A"/>
+            <circle cx="9" cy="9" r="1.8" fill="#2D4A3E"/>
+            <circle cx="19" cy="9" r="1.8" fill="#2D4A3E"/>
+          </svg>
+          <div class="brand-text-stack">
+            <span class="brand-wordmark">TRELLIS</span>
+            <span class="brand-submark">AI HARNESS</span>
+          </div>
+          <span id="conn-badge" class="conn-status-dot disconnected" title="Connecting..." aria-label="Connection status"></span>
+        </div>
+      </div>
+
+      <div class="top-controls">
+        <div class="session-selector-group" id="session-selector-group">
+          <select id="session-select" class="top-select" aria-label="Select Agent Session">
+            <option value="">Loading sessions...</option>
+          </select>
+          <button id="rename-session-btn" class="icon-btn session-edit-btn" type="button" title="Rename selected session (or double-click session dropdown)" aria-label="Rename selected session">
+            ✎
+          </button>
+          <div id="session-rename-inline" class="session-rename-inline hidden">
+            <input id="session-rename-input" class="session-rename-input" type="text" maxlength="68" placeholder="Rename session…" aria-label="New session name" />
+            <button id="session-rename-save" class="mini-btn primary" type="button" title="Save session name (Enter)">✓</button>
+            <button id="session-rename-cancel" class="mini-btn" type="button" title="Cancel (Esc)">✕</button>
+          </div>
+        </div>
+        <button id="active-project-badge" class="icon-btn active-project-pill" type="button" title="Active Workspace Context — Click to switch project directory in Files">
+          📂 ~/code/exo-suit
+        </button>
+        <div id="topbar-devops-strip" class="topbar-devops-strip" role="group" aria-label="Developer Lifecycle Cockpit">
+          <button id="top-git-diff-btn" class="icon-btn devops-pill" type="button" title="Open Live Git Diff &amp; Code Review Workbench on Main Screen">
+            🔀 main • clean
+          </button>
+          <button id="top-test-gate-btn" class="icon-btn devops-pill" type="button" title="Open Anchor Test Runner &amp; Quality Gate on Main Screen">
+            🧪 Tests: Idle
+          </button>
+          <button id="top-deploy-health-btn" class="icon-btn devops-pill" type="button" title="Open Deployment, CI &amp; Service Health Monitor on Main Screen">
+            🚀 Health: OK
+          </button>
+        </div>
+        <button id="top-skills-tools-btn" class="icon-btn" type="button" title="Open Skills &amp; Tools in Main Window">
+          🧰 Skills &amp; Tools (0)
+        </button>
+        <button id="open-keys-btn" class="icon-btn" type="button" title="Inspect Providers &amp; Configure API Keys">⚙️ Providers &amp; Keys</button>
+      </div>
+    </header>
+
+    <!-- Collapsible Left Atelier Provider & Council Roster Rail (Closed by default) -->
+    <aside id="atelier-left-rail" class="atelier-left-rail collapsed"></aside>
+
+    <!-- Central Hardware-Accelerated Canvas Viewport -->
+    <main id="graph-viewport" class="graph-viewport">
+      <canvas id="harness_canvas"></canvas>
+
+      <!-- Edge Re-open Tabs when Side Drawers are Collapsed -->
+      <button id="reopen-left-btn" class="edge-reopen-btn left" type="button" title="Expand Model Roster">
+        » Roster
+      </button>
+      <button id="reopen-right-btn" class="edge-reopen-btn right hidden" type="button" title="Expand Inspector">
+        Inspector «
+      </button>
+
+      <div class="canvas-hud">
+        <button id="reset-view-btn" class="icon-btn" type="button">🎯 Center</button>
+        <button id="auto-layout-btn" class="icon-btn" type="button">✨ Auto-Layout</button>
+      </div>
+
+      <div id="council-stage-banner" class="council-stage-banner hidden">
+        <span id="council-banner-text">🏛️ Council Active</span>
+      </div>
+
+      <button id="interactive-question-banner" class="interactive-question-banner hidden" type="button" hidden>
+        <span class="iq-banner-dot"></span>
+        <span id="interactive-banner-text">❓ Agent is waiting for your answer — Click to respond in Chat →</span>
+      </button>
+
+      <!-- Full-Window Skills & Tools Catalog Overlay inside the Main Window -->
+      <section id="main-skills-tools-overlay" class="main-skills-tools-overlay hidden" aria-label="Skills and Tools Catalog">
+        <div id="pane-skills-tools" class="main-skills-tools-container"></div>
+      </section>
+
+      <!-- Full-Window Document, Artifact & Code Viewer inside the Main Window -->
+      <section id="main-file-viewer-overlay" class="main-file-viewer-overlay hidden" aria-label="Document and File Viewer">
+        <div id="main-file-viewer-container" class="main-file-viewer-container"></div>
+      </section>
+
+      <!-- Full-Window Developer Lifecycle Cockpit & Git Diff / Test / Deploy Workbench -->
+      <section id="main-devops-overlay" class="main-devops-overlay hidden" aria-label="Developer Lifecycle Workbench">
+        <div id="main-devops-container" class="main-devops-container"></div>
+      </section>
+    </main>
+
+    <!-- Collapsible Right Inspector Drawer / Mobile Swipeable Bottom Sheet -->
+    <aside id="inspector-drawer" class="inspector-drawer">
+      <div id="drawer-handle" class="drawer-handle" title="Toggle Drawer">
+        <div class="drawer-handle-bar"></div>
+      </div>
+
+      <div class="drawer-top-row">
+        <nav class="drawer-tabs" aria-label="Inspector Tabs">
+          <button class="tab-btn active" data-tab="chat" type="button" id="tab-btn-chat">💬 CHAT (0)</button>
+          <button class="tab-btn" data-tab="agent" type="button">🤖 AGENT</button>
+          <button class="tab-btn" data-tab="council" type="button" id="tab-btn-council">🏛️ COUNCIL</button>
+          <button class="tab-btn" data-tab="files" type="button">📁 FILES</button>
+          <button class="tab-btn" data-tab="artifacts" type="button" id="tab-btn-artifacts">📑 ARTIFACTS (0)</button>
+        </nav>
+        <button id="collapse-right-btn" class="collapse-drawer-btn" type="button" title="Collapse Inspector Drawer">
+          Hide »
+        </button>
+      </div>
+
+      <div class="drawer-body" id="drawer-scroll-body">
+        <section id="pane-chat" class="tab-pane active"></section>
+        <section id="pane-agent" class="tab-pane"></section>
+        <section id="pane-council" class="tab-pane"></section>
+        <section id="pane-files" class="tab-pane"></section>
+        <section id="pane-artifacts" class="tab-pane"></section>
+      </div>
+    </aside>
+
+    <!-- Full-Width Prominent Bottom Prompt & Council Composer Bar -->
+    <footer class="bottombar">
+      <div class="mode-row">
+        <div class="mode-switch" role="group" aria-label="Execution Mode">
+          <button id="mode-independent-btn" class="mode-btn active" type="button">⚡ Independent Mode</button>
+          <button id="mode-council-btn" class="mode-btn" type="button">🏛️ Council Mode (Negotiate & Vote)</button>
+        </div>
+
+        <div id="lifecycle-pipeline-dock" class="lifecycle-pipeline-dock" role="group" aria-label="Engineering Lifecycle Stage Workflows">
+          <span class="lifecycle-dock-label">Lifecycle:</span>
+          <button type="button" class="lifecycle-chip" data-slash-cmd="/greenfield-architecture" title="Plan &amp; Architect Deep Modules (/greenfield-architecture)">📐 Plan</button>
+          <button type="button" class="lifecycle-chip" data-slash-cmd="/tdd" title="Red-Green-Refactor Test-Driven Development (/tdd)">🧪 TDD</button>
+          <button type="button" class="lifecycle-chip" data-slash-cmd="/bushog" title="Parallel Root-Cause Bug Clearing (/bushog)">🪲 Bushog</button>
+          <button type="button" class="lifecycle-chip" data-slash-cmd="/code-review" title="Dual-Axis Standards &amp; Spec Code Review (/code-review)">🔍 Review</button>
+          <button type="button" class="lifecycle-chip" data-slash-cmd="/survey" title="Spec-Traceable PR Audit &amp; Compilation (/survey)">📋 Survey</button>
+          <button type="button" class="lifecycle-chip" data-slash-cmd="/prod" title="Production Release Cutover &amp; Change Ticket (/prod)">🚀 Prod</button>
+          <button type="button" class="lifecycle-chip" data-slash-cmd="/health" title="Live Platform, Service &amp; Database Health Audit (/health)">🩺 Health</button>
+        </div>
+
+        <div id="council-pills-row" class="council-pills"></div>
+      </div>
+
+      <div id="slash-cmd-popover" class="slash-cmd-popover hidden" role="listbox" aria-label="Slash Command Workflows"></div>
+
+      <form id="prompt-form" class="input-row">
+        <select id="provider-select" name="provider" class="provider-select" aria-label="AI Provider"></select>
+        <select id="model-select" name="model" class="provider-select" aria-label="AI Model"></select>
+        <label for="prompt-input" class="visually-hidden">Prompt message</label>
+        <div id="growable-prompt-wrap" class="growable-textarea" data-replicated-value="">
+          <textarea
+            id="prompt-input"
+            name="prompt"
+            class="prompt-input"
+            rows="1"
+            placeholder="Enter prompt for active project... (Enter to send, Shift+Enter for newline)"
+          ></textarea>
+        </div>
+        <button id="submit-prompt-btn" class="send-btn" type="submit">RUN AGENT ➔</button>
+        <button id="stop-execution-btn" class="stop-btn hidden" type="button" title="Stop in-flight agent or council execution (Esc)">⏹ STOP</button>
+      </form>
+    </footer>
+  </div>
+
+  <!-- Light-Dismiss Dialog for Providers Registry & Runtime Provider API Keys -->
+  <dialog id="provider-keys-dialog" closedby="any" aria-labelledby="keys-dialog-title">
+    <form id="keys-form" method="dialog">
+      <div class="card-header" style="margin-bottom: 10px;">
+        <h2 id="keys-dialog-title" style="font-size: 15px; color: var(--terracotta-strong);">⚙️ Providers &amp; Runtime API Keys</h2>
+        <button type="button" id="close-keys-btn" class="mini-btn">✕</button>
+      </div>
+      <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+        Inspect active System-1 &amp; System-2 providers or configure optional runtime API keys in memory.
+      </p>
+
+      <div id="pane-providers" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; max-block-size: 260px; overflow-y: auto; margin-bottom: 14px; padding-right: 4px;"></div>
+
+      <details class="capability-inspect-details" open>
+        <summary style="margin-bottom: 8px;">🔑 Configure Runtime API Keys (Optional)</summary>
+        <div class="key-field">
+          <label for="key-jev">Jev • TypeSafe System-1 (JEV_API_KEY / TYPESAFE_API_KEY)</label>
+          <input id="key-jev" type="password" placeholder="tsai-..." />
+        </div>
+        <div class="key-field">
+          <label for="key-claude">Claude (ANTHROPIC_API_KEY)</label>
+          <input id="key-claude" type="password" placeholder="sk-ant-..." />
+        </div>
+        <div class="key-field">
+          <label for="key-codex">OpenAI Codex (OPENAI_API_KEY)</label>
+          <input id="key-codex" type="password" placeholder="sk-proj-..." />
+        </div>
+        <div class="key-field">
+          <label for="key-deepseek">DeepSeek (DEEPSEEK_API_KEY)</label>
+          <input id="key-deepseek" type="password" placeholder="sk-..." />
+        </div>
+        <div class="key-field">
+          <label for="key-kimi">Kimi / Moonshot (MOONSHOT_API_KEY)</label>
+          <input id="key-kimi" type="password" placeholder="sk-..." />
+        </div>
+        <div class="key-field">
+          <label for="key-copilot">GitHub Copilot / Models (GITHUB_TOKEN)</label>
+          <input id="key-copilot" type="password" placeholder="ghp_..." />
+        </div>
+
+        <div style="display: flex; gap: 8px; margin-top: 12px;">
+          <button type="submit" id="save-keys-btn" class="action-btn cyan">SAVE &amp; ACTIVATE KEYS</button>
+        </div>
+      </details>
+    </form>
+  </dialog>
+
+  <script src="/app.js?v=20261102i"></script>
+</body>
+</html>
