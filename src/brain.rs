@@ -1,0 +1,2150 @@
+use crate::models::{
+    AgentNode, ArtifactItem, ChatMessage, DecisionEvaluation, DecisionPrimitive, ExecutionScope,
+    FileEntry, FileTreeInfo, InteractivePrompt, InteractiveQuestionItem, OpenedFile, SessionItem,
+    SkillItem, TokenMetrics, ToolCall, ToolCatalogItem,
+};
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+pub fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/Users/coreymcmillan"))
+}
+
+pub fn brain_dir() -> PathBuf {
+    home_dir().join(".gemini").join("antigravity-cli").join("brain")
+}
+
+pub fn code_root_dir() -> PathBuf {
+    home_dir().join("code")
+}
+
+pub fn clean_ansi_and_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&nc) = chars.peek() {
+                    chars.next();
+                    if ('@'..='~').contains(&nc) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+
+    // Extract inside <USER_REQUEST> if present
+    if let (Some(start), Some(end)) = (out.find("<USER_REQUEST>"), out.find("</USER_REQUEST>")) {
+        if start + 14 <= end {
+            return out[start + 14..end].trim().to_string();
+        }
+    }
+    out.trim().to_string()
+}
+
+pub fn sanitize_code_path(requested: &str) -> PathBuf {
+    let root = code_root_dir();
+    let candidate = if requested.is_empty() || requested == "." {
+        root.clone()
+    } else {
+        let p = Path::new(requested);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        }
+    };
+
+    let canonical_root = fs::canonicalize(&root).unwrap_or(root.clone());
+    let canonical_target = fs::canonicalize(&candidate).unwrap_or(candidate);
+
+    if canonical_target.starts_with(&canonical_root) {
+        canonical_target
+    } else {
+        canonical_root
+    }
+}
+
+pub fn list_directory_contents(target_path: &str) -> FileTreeInfo {
+    let root = fs::canonicalize(code_root_dir()).unwrap_or_else(|_| code_root_dir());
+    let safe_path = sanitize_code_path(target_path);
+
+    let rel_path = safe_path
+        .strip_prefix(&root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let can_navigate_up = safe_path != root && !rel_path.is_empty();
+    let mut entries = Vec::new();
+
+    if let Ok(read_dir) = fs::read_dir(&safe_path) {
+        let mut raw_entries: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
+        raw_entries.sort_by_key(|e| e.file_name());
+
+        for entry in raw_entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') && name != ".git" {
+                continue;
+            }
+            let full = entry.path();
+            let is_dir = full.is_dir();
+
+            let is_project = if is_dir {
+                [".git", "Cargo.toml", "package.json", "pyproject.toml", "go.mod"]
+                    .iter()
+                    .any(|m| full.join(m).exists())
+            } else {
+                false
+            };
+
+            let size_bytes = if !is_dir {
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            } else {
+                0
+            };
+
+            let entry_rel = full
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| name.clone());
+
+            entries.push(FileEntry {
+                name,
+                rel_path: entry_rel,
+                is_dir,
+                is_project,
+                size_bytes,
+            });
+        }
+    }
+
+    FileTreeInfo {
+        root_dir: root.to_string_lossy().to_string(),
+        current_rel_path: rel_path,
+        can_navigate_up,
+        entries,
+    }
+}
+
+pub fn classify_file_kind(file_name: &str) -> String {
+    let lower = file_name.to_ascii_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    match ext {
+        "md" | "markdown" | "mdx" => "markdown".to_string(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" => "image".to_string(),
+        "json" | "jsonl" => "json".to_string(),
+        "rs" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "css" | "html" | "htm" | "toml"
+        | "yaml" | "yml" | "sh" | "zsh" | "bash" | "py" | "go" | "sql" | "c" | "cpp" | "h" => {
+            "code".to_string()
+        }
+        _ => "text".to_string(),
+    }
+}
+
+pub fn resolve_sandboxed_file_path(
+    raw_path: &str,
+    active_session_id: &str,
+    active_project: &str,
+) -> Option<PathBuf> {
+    let trimmed = raw_path
+        .trim()
+        .trim_start_matches("file://")
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .replace("%20", " ");
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let code_root = fs::canonicalize(code_root_dir()).unwrap_or_else(|_| code_root_dir());
+    let gemini_root =
+        fs::canonicalize(home_dir().join(".gemini")).unwrap_or_else(|_| home_dir().join(".gemini"));
+
+    let is_allowed = |cand: &Path| -> Option<PathBuf> {
+        let canon = fs::canonicalize(cand).ok()?;
+        if canon.is_file() && (canon.starts_with(&code_root) || canon.starts_with(&gemini_root)) {
+            Some(canon)
+        } else {
+            None
+        }
+    };
+
+    let p = Path::new(&trimmed);
+    if p.is_absolute() {
+        if let Some(found) = is_allowed(p) {
+            return Some(found);
+        }
+    }
+
+    // 1. Check relative to ~/code
+    if let Some(found) = is_allowed(&code_root.join(&trimmed)) {
+        return Some(found);
+    }
+
+    // 2. Check relative to active project inside ~/code/<active_project>
+    if !active_project.is_empty() {
+        if let Some(found) = is_allowed(&code_root.join(active_project).join(&trimmed)) {
+            return Some(found);
+        }
+    }
+
+    // 3. Check inside active session brain directory (~/.gemini/antigravity-cli/brain/<session_id>)
+    if !active_session_id.is_empty() {
+        let s_dir = brain_dir().join(active_session_id);
+        if let Some(found) = is_allowed(&s_dir.join(&trimmed)) {
+            return Some(found);
+        }
+        if !trimmed.ends_with(".md") {
+            if let Some(found) = is_allowed(&s_dir.join(format!("{}.md", trimmed))) {
+                return Some(found);
+            }
+        }
+    }
+
+    // 4. If bare filename, search top-level files of active project and session brain dir
+    if !trimmed.contains('/') {
+        if !active_session_id.is_empty() {
+            for art in get_session_artifacts(active_session_id) {
+                if art.name.eq_ignore_ascii_case(&trimmed)
+                    || Path::new(&art.path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().eq_ignore_ascii_case(&trimmed))
+                        .unwrap_or(false)
+                {
+                    if let Some(found) = is_allowed(Path::new(&art.path)) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn read_bounded_file(
+    rel_file_path: &str,
+    active_session_id: &str,
+    active_project: &str,
+) -> Option<OpenedFile> {
+    let code_root = fs::canonicalize(code_root_dir()).unwrap_or_else(|_| code_root_dir());
+    let gemini_root =
+        fs::canonicalize(home_dir().join(".gemini")).unwrap_or_else(|_| home_dir().join(".gemini"));
+    let safe_path = resolve_sandboxed_file_path(rel_file_path, active_session_id, active_project)?;
+
+    let name = safe_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+
+    let rel_path = if let Ok(rel) = safe_path.strip_prefix(&code_root) {
+        rel.to_string_lossy().to_string()
+    } else if let Ok(rel) = safe_path.strip_prefix(&gemini_root) {
+        format!("~/.gemini/{}", rel.to_string_lossy())
+    } else {
+        safe_path.to_string_lossy().to_string()
+    };
+
+    let abs_path = safe_path.to_string_lossy().to_string();
+    let file_kind = classify_file_kind(&name);
+    let size_bytes = fs::metadata(&safe_path).map(|m| m.len()).unwrap_or(0);
+
+    let content = if file_kind == "image" {
+        format!("/raw-file?path={}", abs_path)
+    } else {
+        match fs::read(&safe_path) {
+            Ok(bytes) => {
+                let slice = if bytes.len() > 250_000 {
+                    &bytes[..250_000]
+                } else {
+                    &bytes[..]
+                };
+                String::from_utf8_lossy(slice).to_string()
+            }
+            Err(e) => format!("Error reading file: {}", e),
+        }
+    };
+
+    Some(OpenedFile {
+        name,
+        rel_path,
+        abs_path,
+        file_kind,
+        size_bytes,
+        content,
+    })
+}
+
+pub fn format_epoch_secs(secs: u64) -> String {
+    // Simple UTC/local human-readable timestamp without heavy timezone crates
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let hours = rem / 3600;
+    let mins = (rem % 3600) / 60;
+
+    // Civil date from days since 1970-01-01 (Howard Hinnant algorithm)
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", year, m, d, hours, mins)
+}
+
+pub fn extract_project_slug_from_text(text: &str) -> Option<String> {
+    let mut slice = text;
+    while let Some(pos) = slice.find("/code/") {
+        let after = &slice[pos + "/code/".len()..];
+        let slug: String = after
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_' || *ch == '.')
+            .collect();
+        if !slug.is_empty() && slug != "." && slug != ".." {
+            return Some(slug);
+        }
+        slice = after;
+    }
+    None
+}
+
+pub fn infer_session_project_id(session_id: &str) -> String {
+    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+        return "exo-suit".to_string();
+    }
+    let s_path = brain_dir().join(session_id);
+    if let Ok(saved) = fs::read_to_string(s_path.join(".session_project.txt")) {
+        let trimmed = saved.trim();
+        if !trimmed.is_empty() && !trimmed.contains("..") {
+            return trimmed.to_string();
+        }
+    }
+
+    let code_root = code_root_dir();
+    for log_name in ["transcript.jsonl", "transcript_full.jsonl"] {
+        let tp = s_path.join(".system_generated").join("logs").join(log_name);
+        if let Ok(content) = fs::read_to_string(&tp) {
+            for line in content.lines() {
+                if let Some(slug) = extract_project_slug_from_text(line) {
+                    if code_root.join(&slug).is_dir() {
+                        return slug;
+                    }
+                }
+            }
+        }
+    }
+
+    "exo-suit".to_string()
+}
+
+pub fn save_session_project_id(session_id: &str, project_id: &str) -> bool {
+    if session_id.is_empty()
+        || session_id.contains("..")
+        || session_id.contains('/')
+        || project_id.trim().is_empty()
+        || project_id.contains("..")
+    {
+        return false;
+    }
+    let s_path = brain_dir().join(session_id);
+    if !s_path.exists() {
+        return false;
+    }
+    fs::write(s_path.join(".session_project.txt"), project_id.trim()).is_ok()
+}
+
+pub fn resolve_execution_scope(session_id: &str, requested_project: &str) -> ExecutionScope {
+    let clean_session = if session_id.trim().is_empty() || session_id.contains("..") {
+        "default-session".to_string()
+    } else {
+        session_id.trim().to_string()
+    };
+
+    let candidate_proj = if !requested_project.trim().is_empty() {
+        requested_project.trim().to_string()
+    } else {
+        infer_session_project_id(&clean_session)
+    };
+
+    let root = fs::canonicalize(code_root_dir()).unwrap_or_else(|_| code_root_dir());
+    let safe_path = sanitize_code_path(&candidate_proj);
+    let resolved_proj = if safe_path == root {
+        // If requested_project escaped ~/code or was root, fall back to exo-suit if it exists
+        let fallback = sanitize_code_path("exo-suit");
+        if fallback != root {
+            return ExecutionScope {
+                session_id: clean_session,
+                project_id: "exo-suit".to_string(),
+                workspace_path: fallback,
+            };
+        }
+        "exo-suit".to_string()
+    } else {
+        safe_path
+            .strip_prefix(&root)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| candidate_proj)
+    };
+
+    ExecutionScope {
+        session_id: clean_session,
+        project_id: resolved_proj,
+        workspace_path: safe_path,
+    }
+}
+
+pub fn get_past_sessions(limit: usize) -> Vec<SessionItem> {
+    let bdir = brain_dir();
+    let mut sessions = Vec::new();
+    let Ok(read_dir) = fs::read_dir(&bdir) else {
+        return sessions;
+    };
+
+    let mut dirs: Vec<(String, PathBuf, u64)> = Vec::new();
+    for entry in read_dir.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let p = entry.path();
+        if p.is_dir() {
+            // Check mtime of transcript.jsonl if available, otherwise dir mtime
+            let transcript_p = p.join(".system_generated").join("logs").join("transcript.jsonl");
+            let mtime = fs::metadata(&transcript_p)
+                .or_else(|_| entry.metadata())
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            dirs.push((name, p, mtime));
+        }
+    }
+
+    dirs.sort_by(|a, b| b.2.cmp(&a.2));
+
+    for (s_id, s_path, mtime) in dirs.into_iter().take(limit) {
+        let artifact_count = fs::read_dir(&s_path)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| {
+                        let fname = e.file_name().to_string_lossy().to_string();
+                        e.path().is_file()
+                            && !fname.starts_with('.')
+                            && !fname.ends_with(".metadata.json")
+                    })
+                    .count() as u32
+            })
+            .unwrap_or(0);
+
+        let mut first_prompt = "Interactive Agent Session".to_string();
+        let mut step_count = 0u32;
+        let mut subagent_count = 0u32;
+
+        let transcript_p = s_path
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+
+        if let Ok(content) = fs::read_to_string(&transcript_p) {
+            for line in content.lines() {
+                step_count += 1;
+                if line.contains("\"invoke_subagent\"") {
+                    subagent_count += 1;
+                }
+                if first_prompt == "Interactive Agent Session" && line.contains("\"USER_INPUT\"") {
+                    if let Ok(val) = serde_json::from_str::<Value>(line) {
+                        if val.get("type").and_then(|t| t.as_str()) == Some("USER_INPUT") {
+                            if let Some(raw_c) = val.get("content").and_then(|c| c.as_str()) {
+                                let cleaned = clean_ansi_and_tags(raw_c);
+                                if !cleaned.is_empty() {
+                                    first_prompt = cleaned.chars().take(64).collect();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let custom_title = fs::read_to_string(s_path.join(".session_title.txt"))
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+
+        let project_id = infer_session_project_id(&s_id);
+
+        sessions.push(SessionItem {
+            session_id: s_id,
+            project_id,
+            updated_at: format_epoch_secs(mtime),
+            prompt_preview: first_prompt,
+            custom_title,
+            artifact_count,
+            step_count,
+            subagent_count,
+        });
+    }
+
+    sessions
+}
+
+pub fn rename_session(session_id: &str, new_title: &str) -> bool {
+    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+        return false;
+    }
+    let s_path = brain_dir().join(session_id);
+    if !s_path.exists() {
+        return false;
+    }
+    let title_file = s_path.join(".session_title.txt");
+    let trimmed = new_title.trim();
+    if trimmed.is_empty() {
+        let _ = fs::remove_file(&title_file);
+        true
+    } else {
+        let bounded: String = trimmed.chars().take(80).collect();
+        fs::write(&title_file, bounded).is_ok()
+    }
+}
+
+fn parse_skill_frontmatter(raw: &str, fallback_name: &str) -> (String, String, String) {
+    let mut name = fallback_name.to_string();
+    let mut description = String::new();
+    let mut body = raw;
+
+    if let Some(after_open) = raw.strip_prefix("---") {
+        if let Some(end_idx) = after_open.find("\n---") {
+            let fm = &after_open[..end_idx];
+            body = after_open[end_idx + 4..].trim_start();
+            let mut in_desc_multiline = false;
+            for line in fm.lines() {
+                let t = line.trim();
+                if let Some(n) = t.strip_prefix("name:") {
+                    name = n.trim().trim_matches('"').trim_matches('\'').to_string();
+                    in_desc_multiline = false;
+                } else if let Some(d) = t.strip_prefix("description:") {
+                    let clean_d = d.trim().trim_matches('"').trim_matches('\'');
+                    if clean_d == "|" || clean_d == ">" || clean_d.is_empty() {
+                        in_desc_multiline = true;
+                    } else {
+                        description = clean_d.to_string();
+                        in_desc_multiline = true;
+                    }
+                } else if in_desc_multiline && (line.starts_with("  ") || line.starts_with('\t')) {
+                    if !t.is_empty() {
+                        if !description.is_empty() {
+                            description.push(' ');
+                        }
+                        description.push_str(t);
+                    }
+                } else if t.contains(':') {
+                    in_desc_multiline = false;
+                }
+            }
+        }
+    }
+
+    if description.is_empty() {
+        description = body
+            .lines()
+            .find(|l| {
+                let tr = l.trim();
+                !tr.is_empty() && !tr.starts_with('#')
+            })
+            .unwrap_or("Specialized agent skill and workflow instructions.")
+            .trim()
+            .chars()
+            .take(220)
+            .collect();
+    } else {
+        description = description.chars().take(260).collect();
+    }
+
+    let preview: String = raw.chars().take(4200).collect();
+    (name, description, preview)
+}
+
+fn scan_skills_dir(dir: &Path, source_label: &str, out: &mut Vec<SkillItem>, seen: &mut HashSet<String>) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let skill_md = p.join("SKILL.md");
+        if !skill_md.is_file() {
+            continue;
+        }
+        let full_path = skill_md.to_string_lossy().to_string();
+        if !seen.insert(full_path.clone()) {
+            continue;
+        }
+        let folder_name = entry.file_name().to_string_lossy().to_string();
+        let Ok(raw) = fs::read_to_string(&skill_md) else {
+            continue;
+        };
+        let (name, description, content_preview) = parse_skill_frontmatter(&raw, &folder_name);
+        out.push(SkillItem {
+            id: format!("{}:{}", source_label, name),
+            name,
+            source: source_label.to_string(),
+            path: full_path,
+            description,
+            content_preview,
+        });
+    }
+}
+
+pub fn get_installed_skills() -> Vec<SkillItem> {
+    let home = home_dir();
+    let gemini = home.join(".gemini");
+    let mut skills = Vec::new();
+    let mut seen = HashSet::new();
+
+    scan_skills_dir(&gemini.join("skills"), "user-skills", &mut skills, &mut seen);
+    scan_skills_dir(&gemini.join("config").join("skills"), "config-skills", &mut skills, &mut seen);
+    scan_skills_dir(
+        &gemini.join("antigravity-cli").join("skills"),
+        "agy-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &gemini.join("antigravity-cli").join("builtin").join("skills"),
+        "builtin-skills",
+        &mut skills,
+        &mut seen,
+    );
+
+    // Also scan plugin skills under ~/.gemini/config/plugins/*/skills
+    let plugins_dir = gemini.join("config").join("plugins");
+    if let Ok(rd) = fs::read_dir(&plugins_dir) {
+        let mut p_entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        p_entries.sort_by_key(|e| e.file_name());
+        for pe in p_entries {
+            let p_name = pe.file_name().to_string_lossy().to_string();
+            let p_skills = pe.path().join("skills");
+            if p_skills.is_dir() {
+                scan_skills_dir(&p_skills, &p_name, &mut skills, &mut seen);
+            }
+        }
+    }
+
+    skills.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    skills
+}
+
+pub fn get_tool_catalog() -> Vec<ToolCatalogItem> {
+    let mut tools = vec![
+        ToolCatalogItem {
+            name: "read_file".to_string(),
+            server: "native-harness".to_string(),
+            mode: "EAGER".to_string(),
+            description: "Read the contents of a text, image, pdf, video, or audio file (up to 800 lines or 46KB per read).".to_string(),
+            parameters_summary: "Path (required), StartLine, EndLine, ByteOffset".to_string(),
+            schema_preview: "{\n  \"name\": \"read_file\",\n  \"required\": [\"Path\"],\n  \"properties\": {\n    \"Path\": { \"type\": \"STRING\", \"description\": \"Absolute path of the file to read\" },\n    \"StartLine\": { \"type\": \"INTEGER\" },\n    \"EndLine\": { \"type\": \"INTEGER\" },\n    \"ByteOffset\": { \"type\": \"INTEGER\" }\n  }\n}".to_string(),
+        },
+        ToolCatalogItem {
+            name: "edit_file".to_string(),
+            server: "native-harness".to_string(),
+            mode: "EAGER".to_string(),
+            description: "Modify an existing file with exact contiguous target-to-replacement matching.".to_string(),
+            parameters_summary: "Path (required), Target (required), Replacement (required), ArtifactMetadata".to_string(),
+            schema_preview: "{\n  \"name\": \"edit_file\",\n  \"required\": [\"Path\", \"Target\", \"Replacement\"],\n  \"properties\": {\n    \"Path\": { \"type\": \"STRING\" },\n    \"Target\": { \"type\": \"STRING\" },\n    \"Replacement\": { \"type\": \"STRING\" }\n  }\n}".to_string(),
+        },
+        ToolCatalogItem {
+            name: "write_file".to_string(),
+            server: "native-harness".to_string(),
+            mode: "EAGER".to_string(),
+            description: "Create a new file or overwrite/append to an existing file or artifact.".to_string(),
+            parameters_summary: "Path (required), Content (required), Overwrite, Append, ArtifactMetadata".to_string(),
+            schema_preview: "{\n  \"name\": \"write_file\",\n  \"required\": [\"Path\", \"Content\"],\n  \"properties\": {\n    \"Path\": { \"type\": \"STRING\" },\n    \"Content\": { \"type\": \"STRING\" },\n    \"Overwrite\": { \"type\": \"BOOLEAN\" },\n    \"Append\": { \"type\": \"BOOLEAN\" }\n  }\n}".to_string(),
+        },
+        ToolCatalogItem {
+            name: "run_command".to_string(),
+            server: "native-harness".to_string(),
+            mode: "EAGER".to_string(),
+            description: "Execute a command in the workspace zsh shell synchronously or as a background daemon task.".to_string(),
+            parameters_summary: "CommandLine (required), WaitMsBeforeAsync (required), toolSummary (required), IsDaemon".to_string(),
+            schema_preview: "{\n  \"name\": \"run_command\",\n  \"required\": [\"CommandLine\", \"WaitMsBeforeAsync\", \"toolSummary\"],\n  \"properties\": {\n    \"CommandLine\": { \"type\": \"STRING\" },\n    \"WaitMsBeforeAsync\": { \"type\": \"INTEGER\" },\n    \"toolSummary\": { \"type\": \"STRING\" },\n    \"IsDaemon\": { \"type\": \"BOOLEAN\" }\n  }\n}".to_string(),
+        },
+        ToolCatalogItem {
+            name: "invoke_subagent".to_string(),
+            server: "native-harness".to_string(),
+            mode: "EAGER".to_string(),
+            description: "Launch an autonomous subagent in its own conversation context with isolated or shared workspace.".to_string(),
+            parameters_summary: "TypeName (required), Role (required), Prompt (required), Model, Workspace".to_string(),
+            schema_preview: "{\n  \"name\": \"invoke_subagent\",\n  \"required\": [\"TypeName\", \"Role\", \"Prompt\"],\n  \"properties\": {\n    \"TypeName\": { \"type\": \"STRING\" },\n    \"Role\": { \"type\": \"STRING\" },\n    \"Prompt\": { \"type\": \"STRING\" },\n    \"Model\": { \"enum\": [\"inherit\", \"flash_lite\", \"flash\", \"pro\"] }\n  }\n}".to_string(),
+        },
+        ToolCatalogItem {
+            name: "define_subagent".to_string(),
+            server: "native-harness".to_string(),
+            mode: "EAGER".to_string(),
+            description: "Define a specialized subagent archetype with custom system prompt and tool permissions.".to_string(),
+            parameters_summary: "Name (required), Description (required), SystemPrompt (required), EnableWriteTools, EnableMCPTools".to_string(),
+            schema_preview: "{\n  \"name\": \"define_subagent\",\n  \"required\": [\"Name\", \"Description\", \"SystemPrompt\"]\n}".to_string(),
+        },
+        ToolCatalogItem {
+            name: "manage_task".to_string(),
+            server: "native-harness".to_string(),
+            mode: "EAGER".to_string(),
+            description: "List, inspect status/logs, send input to, or terminate background tasks.".to_string(),
+            parameters_summary: "Action (list | status | send_input | kill), TaskId, Input".to_string(),
+            schema_preview: "{\n  \"name\": \"manage_task\",\n  \"required\": [\"Action\"],\n  \"properties\": {\n    \"Action\": { \"enum\": [\"list\", \"kill\", \"status\", \"send_input\"] },\n    \"TaskId\": { \"type\": \"STRING\" }\n  }\n}".to_string(),
+        },
+        ToolCatalogItem {
+            name: "call_mcp_tool".to_string(),
+            server: "native-harness".to_string(),
+            mode: "EAGER".to_string(),
+            description: "Invoke any lazy-loaded MCP server tool after inspecting its JSON schema.".to_string(),
+            parameters_summary: "ServerName (required), ToolName (required), Arguments (required)".to_string(),
+            schema_preview: "{\n  \"name\": \"call_mcp_tool\",\n  \"required\": [\"ServerName\", \"ToolName\", \"Arguments\"]\n}".to_string(),
+        },
+        ToolCatalogItem {
+            name: "search_web".to_string(),
+            server: "native-harness".to_string(),
+            mode: "EAGER".to_string(),
+            description: "Perform a web search for a query and return a synthesized summary with URL citations.".to_string(),
+            parameters_summary: "query (required), domain (optional)".to_string(),
+            schema_preview: "{\n  \"name\": \"search_web\",\n  \"required\": [\"query\"]\n}".to_string(),
+        },
+        ToolCatalogItem {
+            name: "ask_question".to_string(),
+            server: "native-harness".to_string(),
+            mode: "EAGER".to_string(),
+            description: "Present interactive single-select or multi-select clarification questions directly to the user in the harness.".to_string(),
+            parameters_summary: "questions (required: array of {question, options, is_multi_select})".to_string(),
+            schema_preview: "{\n  \"name\": \"ask_question\",\n  \"required\": [\"questions\"],\n  \"properties\": {\n    \"questions\": {\n      \"type\": \"ARRAY\",\n      \"items\": {\n        \"properties\": {\n          \"question\": { \"type\": \"STRING\" },\n          \"options\": { \"type\": \"ARRAY\", \"items\": { \"type\": \"STRING\" } },\n          \"is_multi_select\": { \"type\": \"BOOLEAN\" }\n        }\n      }\n    }\n  }\n}".to_string(),
+        },
+    ];
+
+    // Dynamically scan ~/.gemini/antigravity-cli/mcp/<server>/*.json for MCP tool schemas
+    let mcp_root = home_dir().join(".gemini").join("antigravity-cli").join("mcp");
+    if let Ok(rd) = fs::read_dir(&mcp_root) {
+        let mut servers: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        servers.sort_by_key(|e| e.file_name());
+        for s_entry in servers {
+            let s_path = s_entry.path();
+            if !s_path.is_dir() {
+                continue;
+            }
+            let server_name = s_entry.file_name().to_string_lossy().to_string();
+            let Ok(files) = fs::read_dir(&s_path) else {
+                continue;
+            };
+            let mut f_entries: Vec<_> = files.filter_map(|e| e.ok()).collect();
+            f_entries.sort_by_key(|e| e.file_name());
+
+            for f_entry in f_entries {
+                let fp = f_entry.path();
+                let fname = f_entry.file_name().to_string_lossy().to_string();
+                if !fname.ends_with(".json") {
+                    continue;
+                }
+                let tool_name = fname.trim_end_matches(".json").to_string();
+                let Ok(raw_json) = fs::read_to_string(&fp) else {
+                    continue;
+                };
+                let mut desc = format!("MCP tool `{}` on server `{}`", tool_name, server_name);
+                let mut params_vec = Vec::new();
+
+                if let Ok(val) = serde_json::from_str::<Value>(&raw_json) {
+                    if let Some(d) = val.get("description").and_then(|v| v.as_str()) {
+                        desc = d.trim().chars().take(240).collect();
+                    }
+                    let schema_obj = val
+                        .get("parameters")
+                        .or_else(|| val.get("inputSchema"))
+                        .unwrap_or(&val);
+                    let req_set: HashSet<String> = schema_obj
+                        .get("required")
+                        .and_then(|r| r.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    if let Some(props) = schema_obj.get("properties").and_then(|p| p.as_object()) {
+                        for k in props.keys() {
+                            if req_set.contains(k) {
+                                params_vec.push(format!("{}*", k));
+                            } else {
+                                params_vec.push(k.clone());
+                            }
+                        }
+                    }
+                }
+
+                let parameters_summary = if params_vec.is_empty() {
+                    "No parameters".to_string()
+                } else {
+                    params_vec.join(", ")
+                };
+
+                tools.push(ToolCatalogItem {
+                    name: tool_name,
+                    server: server_name.clone(),
+                    mode: "LAZY".to_string(),
+                    description: desc,
+                    parameters_summary,
+                    schema_preview: raw_json.chars().take(3200).collect(),
+                });
+            }
+        }
+    }
+
+    tools
+}
+
+pub fn get_session_artifacts(session_id: &str) -> Vec<ArtifactItem> {
+    let mut artifacts = Vec::new();
+    let s_path = brain_dir().join(session_id);
+    if !s_path.exists() {
+        return artifacts;
+    }
+
+    if let Ok(rd) = fs::read_dir(&s_path) {
+        for entry in rd.filter_map(|e| e.ok()) {
+            let full_f = entry.path();
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if full_f.is_file() && !fname.starts_with('.') && !fname.ends_with(".metadata.json") {
+                let meta_f = s_path.join(format!("{}.metadata.json", fname));
+                let mut summary = format!("Artifact file {}", fname);
+                let mut request_feedback = false;
+                let mut user_facing = true;
+                let mut approved = false;
+
+                if let Ok(meta_str) = fs::read_to_string(&meta_f) {
+                    if let Ok(mdata) = serde_json::from_str::<Value>(&meta_str) {
+                        if let Some(s) = mdata.get("summary").and_then(|v| v.as_str()) {
+                            summary = s.to_string();
+                        }
+                        request_feedback = mdata
+                            .get("requestFeedback")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        user_facing = mdata
+                            .get("userFacing")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        approved = mdata
+                            .get("approved")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                    }
+                }
+
+                let preview = fs::read_to_string(&full_f)
+                    .map(|s| s.chars().take(64_000).collect::<String>())
+                    .unwrap_or_else(|_| "[Binary or non-UTF8 artifact]".to_string());
+
+                artifacts.push(ArtifactItem {
+                    name: fname,
+                    path: full_f.to_string_lossy().to_string(),
+                    summary,
+                    request_feedback,
+                    user_facing,
+                    approved,
+                    content_preview: preview,
+                });
+            }
+        }
+    }
+
+    artifacts
+}
+
+pub fn approve_artifact_metadata(session_id: &str, artifact_name: &str) -> bool {
+    let meta_p = brain_dir()
+        .join(session_id)
+        .join(format!("{}.metadata.json", artifact_name));
+    if let Ok(content) = fs::read_to_string(&meta_p) {
+        if let Ok(mut val) = serde_json::from_str::<Value>(&content) {
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("approved".to_string(), Value::Bool(true));
+                obj.insert("requestFeedback".to_string(), Value::Bool(false));
+                if let Ok(serialized) = serde_json::to_string_pretty(&val) {
+                    return fs::write(&meta_p, serialized).is_ok();
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn load_session_interactive_answers(session_id: &str) -> HashMap<String, Vec<String>> {
+    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+        return HashMap::new();
+    }
+    let p = brain_dir().join(session_id).join(".interactive_answers.json");
+    fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, Vec<String>>>(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_session_interactive_answer(
+    session_id: &str,
+    prompt_id: &str,
+    answers: &[String],
+) -> bool {
+    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+        return false;
+    }
+    let s_dir = brain_dir().join(session_id);
+    if !s_dir.exists() {
+        return false;
+    }
+    let mut map = load_session_interactive_answers(session_id);
+    map.insert(prompt_id.to_string(), answers.to_vec());
+    let p = s_dir.join(".interactive_answers.json");
+    if let Ok(serialized) = serde_json::to_string_pretty(&map) {
+        return fs::write(&p, serialized).is_ok();
+    }
+    false
+}
+
+pub fn parse_ask_question_args(args: Option<&Value>) -> Vec<InteractiveQuestionItem> {
+    let Some(args_obj) = args else {
+        return Vec::new();
+    };
+    let Some(q_val) = args_obj.get("questions") else {
+        return Vec::new();
+    };
+
+    let parsed_arr: Option<Vec<Value>> = match q_val {
+        Value::Array(arr) => Some(arr.clone()),
+        Value::String(s) => {
+            let trimmed = s.trim();
+            serde_json::from_str::<Vec<Value>>(trimmed)
+                .ok()
+                .or_else(|| {
+                    // Sometimes double-encoded or wrapped in quotes
+                    serde_json::from_str::<String>(trimmed)
+                        .ok()
+                        .and_then(|inner| serde_json::from_str::<Vec<Value>>(&inner).ok())
+                })
+        }
+        _ => None,
+    };
+
+    let Some(arr) = parsed_arr else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+    for (idx, item) in arr.into_iter().enumerate() {
+        let question = item
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if question.is_empty() {
+            continue;
+        }
+        let is_multi_select = item
+            .get("is_multi_select")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let options = item
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|opts| {
+                opts.iter()
+                    .filter_map(|o| o.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+
+        items.push(InteractiveQuestionItem {
+            index: idx + 1,
+            question,
+            options,
+            is_multi_select,
+        });
+    }
+    items
+}
+
+fn extract_generic_step_answers(content: &str) -> Vec<String> {
+    let mut answers = Vec::new();
+    let mut past_header = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("Created At:") || t.starts_with("Completed At:") {
+            past_header = true;
+            continue;
+        }
+        if t.starts_with("A1:")
+            || t.starts_with("A2:")
+            || t.starts_with("A3:")
+            || t.starts_with("A4:")
+            || t.starts_with("A5:")
+            || (past_header && !t.starts_with("Showing lines") && !t.starts_with("Command exited"))
+        {
+            answers.push(t.to_string());
+        }
+    }
+    answers
+}
+
+fn load_transcript_values(session_id: &str) -> Vec<Value> {
+    let logs_dir = brain_dir()
+        .join(session_id)
+        .join(".system_generated")
+        .join("logs");
+    let transcript_p = logs_dir.join("transcript.jsonl");
+    let Ok(raw) = fs::read_to_string(&transcript_p) else {
+        return Vec::new();
+    };
+
+    let raw_lines: Vec<&str> = raw.lines().collect();
+    let needs_full = raw_lines.iter().any(|l| {
+        l.contains("\"truncated_fields\"")
+            && (l.contains("\"ask_question\"")
+                || l.contains("Tool is running as a background task")
+                || l.contains("Created the following subagent")
+                || l.contains("background task(s) currently running")
+                || l.contains("\"invoke_subagent\"")
+                || l.contains("\"run_command\""))
+    });
+
+    let full_lines: Vec<String> = if needs_full {
+        fs::read_to_string(logs_dir.join("transcript_full.jsonl"))
+            .map(|s| s.lines().map(|l| l.to_string()).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let mut out = Vec::with_capacity(raw_lines.len());
+    for (idx, line) in raw_lines.into_iter().enumerate() {
+        let use_line = if line.contains("\"truncated_fields\"")
+            && (line.contains("\"ask_question\"")
+                || line.contains("Tool is running as a background task")
+                || line.contains("Created the following subagent")
+                || line.contains("background task(s) currently running")
+                || line.contains("\"invoke_subagent\"")
+                || line.contains("\"run_command\""))
+            && idx < full_lines.len()
+        {
+            full_lines[idx].as_str()
+        } else {
+            line
+        };
+        if let Ok(val) = serde_json::from_str::<Value>(use_line) {
+            out.push(val);
+        }
+    }
+    out
+}
+
+/// Parses a session's `transcript.jsonl` into a chronological conversation thread of user and
+/// assistant turns, folding intermediate tool-call / thinking steps into cohesive assistant replies
+/// and surfacing interactive CLI questions (`ask_question`) as structured interactive prompts.
+pub fn get_session_chat_thread(session_id: &str) -> Vec<ChatMessage> {
+    let mut thread: Vec<ChatMessage> = Vec::new();
+    let steps = load_transcript_values(session_id);
+    if steps.is_empty() {
+        return thread;
+    }
+
+    let saved_answers = load_session_interactive_answers(session_id);
+
+    let mut pending_thinking: Option<String> = None;
+    let mut pending_tools: Vec<ToolCall> = Vec::new();
+    let mut pending_content = String::new();
+    let mut pending_step: u32 = 0;
+    let mut pending_ts = String::new();
+    let mut turn_anchor_step: u32 = 0;
+    let mut last_step_had_tools = false;
+    let mut has_open_turn = false;
+
+    for (idx, val) in steps.iter().enumerate() {
+        let step_index = val
+            .get("step_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let step_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let created_at = val
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(19)
+            .collect::<String>()
+            .replace('T', " ");
+
+        if step_type == "USER_INPUT" {
+            let Some(raw_c) = val.get("content").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            // Skip pure system/task wakeup messages that don't contain a user request
+            if raw_c.contains("<SYSTEM_MESSAGE>") && !raw_c.contains("<USER_REQUEST>") {
+                continue;
+            }
+            let cleaned = clean_ansi_and_tags(raw_c);
+            if cleaned.is_empty() || cleaned.starts_with("<CONTEXT_SUMMARY>") {
+                continue;
+            }
+
+            // Flush any previous assistant turn before starting a new user turn
+            if !pending_content.is_empty() || pending_thinking.is_some() || !pending_tools.is_empty()
+            {
+                if pending_tools.len() > 45 {
+                    pending_tools = pending_tools.split_off(pending_tools.len() - 45);
+                }
+                thread.push(ChatMessage {
+                    id: format!("msg-turn-{}", turn_anchor_step),
+                    step_index: pending_step,
+                    role: "assistant".to_string(),
+                    sender: "Antigravity".to_string(),
+                    provider: "antigravity".to_string(),
+                    model: "gemini-4-argon".to_string(),
+                    timestamp: pending_ts.clone(),
+                    content: std::mem::take(&mut pending_content),
+                    thinking: pending_thinking.take(),
+                    tool_calls: std::mem::take(&mut pending_tools),
+                    streaming: false,
+                    interactive_prompt: None,
+                });
+            }
+
+            thread.push(ChatMessage {
+                id: format!("msg-{}", step_index),
+                step_index,
+                role: "user".to_string(),
+                sender: "You".to_string(),
+                provider: "user".to_string(),
+                model: String::new(),
+                timestamp: created_at.clone(),
+                content: cleaned,
+                thinking: None,
+                tool_calls: Vec::new(),
+                streaming: false,
+                interactive_prompt: None,
+            });
+
+            turn_anchor_step = step_index + 1;
+            pending_step = step_index + 1;
+            pending_ts = created_at;
+            last_step_had_tools = false;
+            has_open_turn = true;
+        } else if step_type == "PLANNER_RESPONSE" {
+            if turn_anchor_step == 0 {
+                turn_anchor_step = step_index;
+            }
+            pending_step = step_index;
+            has_open_turn = true;
+            if !created_at.is_empty() {
+                pending_ts = created_at.clone();
+            }
+
+            if let Some(th) = val.get("thinking").and_then(|v| v.as_str()) {
+                let t = th.trim();
+                if !t.is_empty() {
+                    pending_thinking = Some(t.chars().take(900).collect());
+                }
+            }
+
+            if let Some(c) = val.get("content").and_then(|v| v.as_str()) {
+                let trimmed = c.trim();
+                if !trimmed.is_empty() {
+                    pending_content = trimmed.chars().take(8000).collect();
+                }
+            }
+
+            let mut step_interactive_questions: Vec<InteractiveQuestionItem> = Vec::new();
+
+            if let Some(tcs) = val.get("tool_calls").and_then(|v| v.as_array()) {
+                if !tcs.is_empty() {
+                    last_step_had_tools = true;
+                    for tc in tcs {
+                        let name = tc
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tool")
+                            .to_string();
+                        let args = tc.get("args");
+
+                        if name == "ask_question" {
+                            let parsed_qs = parse_ask_question_args(args);
+                            if !parsed_qs.is_empty() {
+                                step_interactive_questions = parsed_qs;
+                            }
+                        }
+
+                        let raw_summary = if name == "ask_question" {
+                            step_interactive_questions
+                                .first()
+                                .map(|q| q.question.as_str())
+                                .unwrap_or("Interactive clarification question")
+                        } else {
+                            args.and_then(|a| {
+                                a.get("toolSummary")
+                                    .or_else(|| a.get("Path"))
+                                    .or_else(|| a.get("CommandLine"))
+                                    .or_else(|| a.get("Role"))
+                                    .or_else(|| a.get("query"))
+                            })
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Executing operation")
+                            .trim_matches('"')
+                        };
+
+                        let clean_summary = raw_summary
+                            .replace("/Users/coreymcmillan/code/exo-suit/", "")
+                            .replace("/Users/coreymcmillan/code/", "")
+                            .replace("/Users/coreymcmillan/.gemini/antigravity-cli/", "~/.gemini/")
+                            .chars()
+                            .take(78)
+                            .collect::<String>();
+
+                        pending_tools.push(ToolCall {
+                            name,
+                            summary: clean_summary,
+                            status: "Completed".to_string(),
+                        });
+                    }
+                } else {
+                    last_step_had_tools = false;
+                }
+            } else {
+                last_step_had_tools = false;
+            }
+
+            // If this PLANNER_RESPONSE presented interactive questions via `ask_question`,
+            // surface it immediately as a dedicated interactive message card in the chat thread!
+            if !step_interactive_questions.is_empty() {
+                let prompt_id = format!("ask-step-{}", step_index);
+                let mut cli_answers = Vec::new();
+                let has_subsequent_steps = idx + 1 < steps.len();
+
+                for next_val in steps.iter().skip(idx + 1).take(6) {
+                    let next_type = next_val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if next_type == "GENERIC" {
+                        if let Some(nc) = next_val.get("content").and_then(|v| v.as_str()) {
+                            let extracted = extract_generic_step_answers(nc);
+                            if !extracted.is_empty() {
+                                cli_answers = extracted;
+                                break;
+                            }
+                        }
+                    } else if next_type == "PLANNER_RESPONSE" || next_type == "USER_INPUT" {
+                        break;
+                    }
+                }
+
+                let final_answers = if !cli_answers.is_empty() {
+                    cli_answers
+                } else if let Some(saved) = saved_answers.get(&prompt_id) {
+                    saved.clone()
+                } else {
+                    Vec::new()
+                };
+
+                let is_answered = !final_answers.is_empty() || has_subsequent_steps;
+                let prompt_status = if is_answered {
+                    "Answered".to_string()
+                } else {
+                    "Pending".to_string()
+                };
+
+                if pending_tools.len() > 45 {
+                    pending_tools = pending_tools.split_off(pending_tools.len() - 45);
+                }
+
+                thread.push(ChatMessage {
+                    id: format!("msg-ask-{}", step_index),
+                    step_index,
+                    role: "assistant".to_string(),
+                    sender: "Antigravity".to_string(),
+                    provider: "antigravity".to_string(),
+                    model: "gemini-4-argon".to_string(),
+                    timestamp: pending_ts.clone(),
+                    content: std::mem::take(&mut pending_content),
+                    thinking: pending_thinking.take(),
+                    tool_calls: std::mem::take(&mut pending_tools),
+                    streaming: false,
+                    interactive_prompt: Some(InteractivePrompt {
+                        prompt_id,
+                        step_index,
+                        status: prompt_status,
+                        questions: step_interactive_questions,
+                        answers: final_answers,
+                    }),
+                });
+
+                turn_anchor_step = step_index + 1;
+                pending_step = step_index + 1;
+                last_step_had_tools = false;
+                has_open_turn = false;
+            }
+        }
+    }
+
+    // Emit the final/active assistant turn at the end of the transcript
+    if has_open_turn
+        || !pending_content.is_empty()
+        || pending_thinking.is_some()
+        || !pending_tools.is_empty()
+    {
+        if pending_tools.len() > 45 {
+            pending_tools = pending_tools.split_off(pending_tools.len() - 45);
+        }
+        // The turn is actively streaming/working if the latest step invoked tools or final content hasn't arrived yet
+        let is_streaming = last_step_had_tools || pending_content.is_empty();
+        if is_streaming {
+            if let Some(last_tc) = pending_tools.last_mut() {
+                last_tc.status = "Running".to_string();
+            }
+        }
+        thread.push(ChatMessage {
+            id: format!("msg-turn-{}", turn_anchor_step),
+            step_index: pending_step,
+            role: "assistant".to_string(),
+            sender: "Antigravity".to_string(),
+            provider: "antigravity".to_string(),
+            model: "gemini-4-argon".to_string(),
+            timestamp: pending_ts,
+            content: pending_content,
+            thinking: pending_thinking.take(),
+            tool_calls: std::mem::take(&mut pending_tools),
+            streaming: is_streaming,
+            interactive_prompt: None,
+        });
+    }
+
+    // Keep the most recent 60 messages to preserve the sub-20MB memory footprint
+    if thread.len() > 60 {
+        thread = thread.split_off(thread.len() - 60);
+    }
+
+    thread
+}
+
+/// Parses a real session's `transcript.jsonl` and recursively follows spawned `invoke_subagent`
+/// conversationIds to build the live multi-agent execution tree.
+pub fn build_live_session_graph(session_id: &str, active_project: &str) -> Vec<AgentNode> {
+    let mut nodes = Vec::new();
+    let mut visited = HashSet::new();
+
+    parse_session_node_recursive(
+        session_id,
+        "",
+        "Antigravity Lead Agent",
+        active_project,
+        460.0,
+        140.0,
+        0,
+        &mut nodes,
+        &mut visited,
+    );
+
+    if nodes.is_empty() {
+        return fallback_project_graph(active_project);
+    }
+
+    nodes
+}
+
+#[derive(Clone, Debug)]
+struct RunningTaskInfo {
+    task_id: String,
+    short_id: String,
+    summary: String,
+    command: String,
+    is_daemon: bool,
+    step_index: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_session_node_recursive(
+    session_id: &str,
+    parent_id: &str,
+    default_role: &str,
+    active_project: &str,
+    x: f32,
+    y: f32,
+    depth: usize,
+    nodes: &mut Vec<AgentNode>,
+    visited: &mut HashSet<String>,
+) {
+    if depth > 3 || visited.contains(session_id) {
+        return;
+    }
+    visited.insert(session_id.to_string());
+
+    let steps = load_transcript_values(session_id);
+    if steps.is_empty() {
+        return;
+    }
+
+    let saved_answers = load_session_interactive_answers(session_id);
+
+    let mut prompt = String::new();
+    let mut thinking = String::new();
+    let mut recent_log = String::new();
+    let mut status = "Completed".to_string();
+    let mut step_count = 0u32;
+    let mut tokens = TokenMetrics::default();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut outputs: Vec<String> = Vec::new();
+    let mut child_subagents: Vec<(String, String, String)> = Vec::new(); // (conv_id, role, prompt)
+    let mut completed_subagents: HashSet<String> = HashSet::new();
+    let mut pending_subagent_meta: Vec<(String, String)> = Vec::new();
+    let mut pending_cmd_meta: Vec<(String, String, bool)> = Vec::new();
+    let mut running_tasks: Vec<RunningTaskInfo> = Vec::new();
+    let mut latest_interactive_prompt: Option<InteractivePrompt> = None;
+
+    let total_lines = steps.len();
+
+    for (idx, val) in steps.iter().enumerate() {
+        step_count = val
+            .get("step_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(step_count as u64 + 1) as u32;
+
+        let step_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let step_status = val.get("status").and_then(|v| v.as_str()).unwrap_or("DONE");
+
+        if let Some(in_tok) = val.get("input_tokens").and_then(|v| v.as_u64()) {
+            tokens.input_tokens += in_tok;
+        }
+        if let Some(cache_tok) = val.get("cache_read_tokens").and_then(|v| v.as_u64()) {
+            tokens.cache_read_tokens += cache_tok;
+        }
+        if let Some(out_tok) = val.get("output_tokens").and_then(|v| v.as_u64()) {
+            tokens.output_tokens += out_tok;
+        }
+
+        if step_type == "USER_INPUT" {
+            if let Some(c) = val.get("content").and_then(|v| v.as_str()) {
+                let cleaned = clean_ansi_and_tags(c);
+                if !cleaned.is_empty() {
+                    prompt = cleaned;
+                }
+            }
+        } else if step_type == "PLANNER_RESPONSE" {
+            if let Some(th) = val.get("thinking").and_then(|v| v.as_str()) {
+                let trimmed = th.trim();
+                if !trimmed.is_empty() {
+                    thinking = trimmed.chars().take(600).collect();
+                }
+            }
+
+            if let Some(tcs) = val.get("tool_calls").and_then(|v| v.as_array()) {
+                pending_cmd_meta.clear();
+                for tc in tcs {
+                    let name = tc
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool")
+                        .to_string();
+                    let args = tc.get("args");
+
+                    if name == "invoke_subagent" {
+                        let role_arg = args
+                            .and_then(|a| a.get("Role"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Subagent")
+                            .trim_matches('"')
+                            .to_string();
+                        let prompt_arg = args
+                            .and_then(|a| a.get("Prompt"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Delegated subagent workflow")
+                            .trim_matches('"')
+                            .chars()
+                            .take(240)
+                            .collect::<String>();
+                        pending_subagent_meta.push((role_arg, prompt_arg));
+                    } else if name == "run_command" {
+                        let sum_arg = args
+                            .and_then(|a| a.get("toolSummary"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Background Task")
+                            .trim_matches('"')
+                            .to_string();
+                        let cmd_arg = args
+                            .and_then(|a| a.get("CommandLine"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim_matches('"')
+                            .to_string();
+                        let is_daemon = args
+                            .and_then(|a| a.get("IsDaemon"))
+                            .and_then(|v| {
+                                v.as_bool()
+                                    .or_else(|| v.as_str().map(|s| s.trim_matches('"') == "true"))
+                            })
+                            .unwrap_or(false);
+                        pending_cmd_meta.push((sum_arg, cmd_arg, is_daemon));
+                    } else if name == "manage_task" {
+                        let action = args
+                            .and_then(|a| a.get("Action"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim_matches('"');
+                        if action == "kill" {
+                            if let Some(tid) = args
+                                .and_then(|a| a.get("TaskId"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim_matches('"'))
+                            {
+                                running_tasks.retain(|rt| rt.task_id != tid && !tid.ends_with(&rt.short_id));
+                            }
+                        }
+                    } else if name == "manage_subagents" {
+                        let action = args
+                            .and_then(|a| a.get("Action"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim_matches('"');
+                        if action == "kill_all" {
+                            for (cid, _, _) in &child_subagents {
+                                completed_subagents.insert(cid.clone());
+                            }
+                        }
+                    }
+
+                    if name == "ask_question" {
+                        let parsed_qs = parse_ask_question_args(args);
+                        if !parsed_qs.is_empty() {
+                            let prompt_id = format!("ask-step-{}", step_count);
+                            let mut cli_answers = Vec::new();
+                            let has_subsequent_steps = idx + 1 < total_lines;
+                            for next_val in steps.iter().skip(idx + 1).take(6) {
+                                let next_type =
+                                    next_val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                if next_type == "GENERIC" {
+                                    if let Some(nc) =
+                                        next_val.get("content").and_then(|v| v.as_str())
+                                    {
+                                        let extracted = extract_generic_step_answers(nc);
+                                        if !extracted.is_empty() {
+                                            cli_answers = extracted;
+                                            break;
+                                        }
+                                    }
+                                } else if next_type == "PLANNER_RESPONSE"
+                                    || next_type == "USER_INPUT"
+                                {
+                                    break;
+                                }
+                            }
+                            let final_answers = if !cli_answers.is_empty() {
+                                cli_answers
+                            } else if let Some(saved) = saved_answers.get(&prompt_id) {
+                                saved.clone()
+                            } else {
+                                Vec::new()
+                            };
+                            let is_answered = !final_answers.is_empty() || has_subsequent_steps;
+                            latest_interactive_prompt = Some(InteractivePrompt {
+                                prompt_id,
+                                step_index: step_count,
+                                status: if is_answered {
+                                    "Answered".to_string()
+                                } else {
+                                    "Pending".to_string()
+                                },
+                                questions: parsed_qs,
+                                answers: final_answers,
+                            });
+                        }
+                    }
+
+                    let summary = args
+                        .and_then(|a| {
+                            a.get("toolSummary")
+                                .or_else(|| a.get("Path"))
+                                .or_else(|| a.get("CommandLine"))
+                                .or_else(|| a.get("Role"))
+                        })
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Executed tool call")
+                        .trim_matches('"')
+                        .chars()
+                        .take(80)
+                        .collect::<String>();
+
+                    recent_log = format!("{} → {}", name, summary);
+
+                    let is_last = idx + 1 >= total_lines;
+                    let tc_status = if is_last && step_status != "DONE" {
+                        "Running".to_string()
+                    } else {
+                        "Completed".to_string()
+                    };
+
+                    tool_calls.push(ToolCall {
+                        name: name.clone(),
+                        summary: summary.clone(),
+                        status: tc_status,
+                    });
+                }
+            }
+
+            if let Some(c) = val.get("content").and_then(|v| v.as_str()) {
+                let trimmed = c.trim();
+                if !trimmed.is_empty() {
+                    recent_log = trimmed.lines().next().unwrap_or("").chars().take(90).collect();
+                    outputs.push(trimmed.chars().take(2400).collect());
+                }
+            }
+        } else if step_type == "GENERIC" {
+            if let Some(c) = val.get("content").and_then(|v| v.as_str()) {
+                // 1. Check if this step created subagents
+                if c.contains("Created the following subagent:") && c.contains("\"conversationId\"") {
+                    for cap_line in c.lines() {
+                        if let Some(pos) = cap_line.find("\"conversationId\"") {
+                            let rest = &cap_line[pos + 16..];
+                            let conv_id: String = rest
+                                .chars()
+                                .filter(|ch| ch.is_ascii_hexdigit() || *ch == '-')
+                                .collect();
+                            if conv_id.len() >= 32 {
+                                let (sub_role, sub_prompt) = if !pending_subagent_meta.is_empty() {
+                                    pending_subagent_meta.remove(0)
+                                } else {
+                                    (
+                                        format!("Subagent {}", child_subagents.len() + 1),
+                                        "Delegated subagent workflow".to_string(),
+                                    )
+                                };
+                                completed_subagents.remove(&conv_id);
+                                if !child_subagents.iter().any(|(id, _, _)| id == &conv_id) {
+                                    child_subagents.push((conv_id, sub_role, sub_prompt));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Check if this step launched a background task
+                if let Some(pos) = c.find("Tool is running as a background task with task id:") {
+                    let after = &c[pos + "Tool is running as a background task with task id:".len()..];
+                    let task_id: String = after
+                        .trim_start()
+                        .chars()
+                        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '/')
+                        .collect();
+                    if task_id.contains("/task-") {
+                        let short_tid = task_id
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&task_id)
+                            .to_string();
+                        let (sum_meta, cmd_meta, is_daemon) = if !pending_cmd_meta.is_empty() {
+                            pending_cmd_meta.remove(0)
+                        } else {
+                            let desc = c
+                                .replace("\\n", "\n")
+                                .lines()
+                                .find_map(|l| l.strip_prefix("Task Description:"))
+                                .unwrap_or("Background Command")
+                                .trim()
+                                .to_string();
+                            let daemon_guess = desc.contains("exo-suit") || desc.contains("daemon");
+                            (desc.clone(), desc, daemon_guess)
+                        };
+                        // Remove any duplicate task_id or superseded daemon with the same command/summary
+                        running_tasks.retain(|rt| {
+                            rt.task_id != task_id
+                                && !(is_daemon
+                                    && rt.is_daemon
+                                    && (rt.command == cmd_meta || rt.summary == sum_meta))
+                        });
+                        running_tasks.push(RunningTaskInfo {
+                            task_id,
+                            short_id: short_tid,
+                            summary: sum_meta,
+                            command: cmd_meta,
+                            is_daemon,
+                            step_index: step_count,
+                        });
+                    }
+                }
+
+                // 3. Check if a task was cancelled, finished, or listed via manage_task output
+                let unescaped_c = c.replace("\\n", "\n").replace("\\\"", "\"");
+                if unescaped_c.contains("No background tasks are currently running") {
+                    running_tasks.clear();
+                } else if unescaped_c.contains("background task(s) currently running:") {
+                    let mut active_ids = HashSet::new();
+                    let mut search_slice = unescaped_c.as_str();
+                    while let Some(p) = search_slice.find("\"taskId\":\"") {
+                        let rest = &search_slice[p + "\"taskId\":\"".len()..];
+                        let tid: String = rest
+                            .chars()
+                            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '/')
+                            .collect();
+                        if !tid.is_empty() {
+                            active_ids.insert(tid);
+                        }
+                        search_slice = rest;
+                    }
+                    if !active_ids.is_empty() {
+                        running_tasks.retain(|rt| active_ids.contains(&rt.task_id));
+                    }
+                }
+                if unescaped_c.contains("Status: DONE") || unescaped_c.contains("cancelled.") {
+                    for line in unescaped_c.lines() {
+                        if let Some(tid) = line.strip_prefix("Task: ") {
+                            let clean_tid = tid.trim();
+                            running_tasks.retain(|rt| rt.task_id != clean_tid);
+                        } else if line.contains("Task \"") && line.contains("\" cancelled") {
+                            let parts: Vec<&str> = line.split('"').collect();
+                            if parts.len() >= 2 {
+                                let clean_tid = parts[1];
+                                running_tasks.retain(|rt| rt.task_id != clean_tid);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if step_type == "SYSTEM_MESSAGE" {
+            if let Some(c) = val.get("content").and_then(|v| v.as_str()) {
+                // Check for task completion or subagent completion notifications:
+                // e.g. `sender=eae8f37c-.../task-922 ... Task id "..." finished`
+                // or `sender=a0538fe0-77e1-4dda-b0c7-5ac816b80550`
+                for token in c.split_whitespace() {
+                    if let Some(sender) = token.strip_prefix("sender=") {
+                        let clean_sender = sender.trim_matches(|ch: char| {
+                            !ch.is_ascii_alphanumeric() && ch != '-' && ch != '/'
+                        });
+                        if clean_sender.contains("/task-") {
+                            running_tasks.retain(|rt| rt.task_id != clean_sender);
+                        } else if clean_sender.len() >= 32 {
+                            completed_subagents.insert(clean_sender.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Determine live status from latest step, active tasks, or pending interactive question
+    let latest_step_has_tools = steps
+        .last()
+        .and_then(|v| v.get("tool_calls"))
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
+    if let Some(ref ip) = latest_interactive_prompt {
+        if ip.status == "Pending" {
+            status = "AwaitingUserInput".to_string();
+            let q_len = ip.questions.len();
+            recent_log = format!(
+                "❓ Awaiting user input ({} question{})",
+                q_len,
+                if q_len == 1 { "" } else { "s" }
+            );
+        }
+    } else if latest_step_has_tools || (!tool_calls.is_empty() && outputs.is_empty()) {
+        status = "Running".to_string();
+    }
+    if recent_log.is_empty() {
+        recent_log = if !prompt.is_empty() {
+            format!("Prompt: {}", prompt.chars().take(60).collect::<String>())
+        } else {
+            "Session ready".to_string()
+        };
+    }
+
+    let short_id = if session_id.len() > 8 {
+        format!("agy-{}", &session_id[..8])
+    } else {
+        session_id.to_string()
+    };
+
+    // Keep last 12 tool calls & last 5 outputs for minimal memory footprint
+    if tool_calls.len() > 12 {
+        tool_calls = tool_calls.split_off(tool_calls.len() - 12);
+    }
+    if outputs.len() > 5 {
+        outputs = outputs.split_off(outputs.len() - 5);
+    }
+
+    nodes.push(AgentNode {
+        agent_id: short_id.clone(),
+        parent_id: parent_id.to_string(),
+        node_kind: if depth == 0 {
+            "agent".to_string()
+        } else {
+            "subagent".to_string()
+        },
+        provider: "antigravity".to_string(),
+        model: "gemini-4-argon".to_string(),
+        role: default_role.to_string(),
+        status,
+        execution_step: step_count,
+        prompt: if prompt.is_empty() {
+            format!("Workspace orchestration in ~/code/{}", active_project)
+        } else {
+            prompt
+        },
+        thinking,
+        context: format!(
+            "Session: {}\nWorkspace: ~/code/{}\nTokens: {} in / {} cached / {} out",
+            session_id,
+            active_project,
+            tokens.input_tokens,
+            tokens.cache_read_tokens,
+            tokens.output_tokens
+        ),
+        recent_log,
+        tokens,
+        tool_calls: tool_calls.clone(),
+        outputs,
+        x,
+        y,
+        council_score: None,
+        is_council_winner: false,
+        decision_eval: None,
+        interactive_prompt: latest_interactive_prompt,
+    });
+
+    // Filter to ONLY currently running subagents (subagents that have not yet returned a completion message)
+    let active_subagents: Vec<(String, String, String)> = child_subagents
+        .into_iter()
+        .filter(|(sub_id, _, _)| {
+            if completed_subagents.contains(sub_id) {
+                return false;
+            }
+            // Also verify from the subagent's own transcript whether it already sent its completion message back
+            let sub_steps = load_transcript_values(sub_id);
+            let sent_back = sub_steps.iter().any(|sv| {
+                sv.get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter().any(|tc| {
+                            tc.get("name").and_then(|n| n.as_str()) == Some("send_message")
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            !sent_back
+        })
+        .collect();
+
+    if !active_subagents.is_empty() {
+        let count = active_subagents.len() as f32;
+        let spacing = 260.0;
+        let start_x = x - ((count - 1.0) * spacing) / 2.0;
+
+        for (i, (sub_id, sub_role, _sub_prompt)) in active_subagents.into_iter().enumerate() {
+            let child_x = start_x + (i as f32) * spacing;
+            let child_y = y + 195.0;
+            parse_session_node_recursive(
+                &sub_id,
+                &short_id,
+                &sub_role,
+                active_project,
+                child_x,
+                child_y,
+                depth + 1,
+                nodes,
+                visited,
+            );
+        }
+    }
+
+    // Represent currently running tasks (background commands, daemons, or active tool executions)
+    // as visually distinct Task nodes (`node_kind: "task"`) on the graph!
+    if depth == 0 {
+        let mut task_items: Vec<RunningTaskInfo> = running_tasks;
+
+        // If the latest step in the transcript is actively executing a synchronous tool call,
+        // also surface it as a live transient task capsule while it runs
+        if let Some(last_step) = steps.last() {
+            let l_type = last_step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let l_status = last_step.get("status").and_then(|v| v.as_str()).unwrap_or("DONE");
+            if l_type == "PLANNER_RESPONSE" && l_status != "DONE" {
+                if let Some(tcs) = last_step.get("tool_calls").and_then(|v| v.as_array()) {
+                    for (t_idx, tc) in tcs.iter().enumerate() {
+                        let t_name = tc
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tool")
+                            .to_string();
+                        if t_name != "invoke_subagent" && t_name != "ask_question" {
+                            let args = tc.get("args");
+                            let t_sum = args
+                                .and_then(|a| {
+                                    a.get("toolSummary")
+                                        .or_else(|| a.get("Path"))
+                                        .or_else(|| a.get("CommandLine"))
+                                })
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Executing tool")
+                                .trim_matches('"')
+                                .to_string();
+                            task_items.push(RunningTaskInfo {
+                                task_id: format!("{}/live-tool-{}", session_id, t_idx + 1),
+                                short_id: format!("tool-{}", t_name),
+                                summary: format!("{}: {}", t_name, t_sum),
+                                command: t_sum,
+                                is_daemon: false,
+                                step_index: step_count,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if !task_items.is_empty() {
+            let count = task_items.len() as f32;
+            let spacing = 245.0;
+            let start_x = x - ((count - 1.0) * spacing) / 2.0;
+            let task_y = y + 185.0;
+
+            for (i, rt) in task_items.into_iter().enumerate() {
+                let task_node_id = format!("{}-{}", short_id, rt.short_id);
+                let kind_badge = if rt.is_daemon { "DAEMON" } else { "TASK" };
+                nodes.push(AgentNode {
+                    agent_id: task_node_id,
+                    parent_id: short_id.clone(),
+                    node_kind: "task".to_string(),
+                    provider: "antigravity".to_string(),
+                    model: format!("{} • {}", kind_badge, rt.short_id),
+                    role: rt.summary.chars().take(34).collect(),
+                    status: "Running".to_string(),
+                    execution_step: rt.step_index,
+                    prompt: rt.command.clone(),
+                    thinking: if rt.is_daemon {
+                        "Long-running background daemon process monitored by Trellis harness."
+                            .to_string()
+                    } else {
+                        "Active background task executing in workspace shell.".to_string()
+                    },
+                    context: format!(
+                        "Task ID: {}\nMode: {}\nCommand: {}",
+                        rt.task_id,
+                        if rt.is_daemon {
+                            "Background Daemon (IsDaemon=true)"
+                        } else {
+                            "Asynchronous Task"
+                        },
+                        rt.command
+                    ),
+                    recent_log: rt.command.chars().take(80).collect(),
+                    tokens: TokenMetrics::default(),
+                    tool_calls: vec![ToolCall {
+                        name: if rt.is_daemon {
+                            "daemon_process".to_string()
+                        } else {
+                            "run_command".to_string()
+                        },
+                        summary: rt.summary,
+                        status: "Running".to_string(),
+                    }],
+                    outputs: vec![],
+                    x: start_x + (i as f32) * spacing,
+                    y: task_y,
+                    council_score: None,
+                    is_council_winner: false,
+                    decision_eval: None,
+                    interactive_prompt: None,
+                });
+            }
+        }
+    }
+}
+
+pub fn fallback_project_graph(project_name: &str) -> Vec<AgentNode> {
+    let p_clean = Path::new(project_name)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "exo-suit".to_string());
+
+    vec![
+        AgentNode {
+            agent_id: format!("{}-orchestrator", p_clean),
+            parent_id: String::new(),
+            node_kind: "agent".to_string(),
+            provider: "antigravity".to_string(),
+            model: "gemini-4-argon".to_string(),
+            role: format!("{} Lead Orchestrator", p_clean),
+            status: "Running".to_string(),
+            execution_step: 12,
+            prompt: format!("Orchestrate multi-provider workflow for {}", p_clean),
+            thinking: "Evaluating workspace dependency graph and subagent readiness.".to_string(),
+            context: format!("Workspace: ~/code/{}", p_clean),
+            recent_log: format!("Monitoring ~/code/{}...", p_clean),
+            tokens: TokenMetrics {
+                input_tokens: 14200,
+                cache_read_tokens: 9800,
+                output_tokens: 640,
+            },
+            tool_calls: vec![ToolCall {
+                name: "list_dir".to_string(),
+                summary: format!("Scanned ~/code/{}", p_clean),
+                status: "Completed".to_string(),
+            }],
+            outputs: vec![format!("Workspace {} ready", p_clean)],
+            x: 460.0,
+            y: 140.0,
+            council_score: None,
+            is_council_winner: false,
+            decision_eval: None,
+            interactive_prompt: None,
+        },
+        AgentNode {
+            agent_id: format!("{}-jev-gate", p_clean),
+            parent_id: format!("{}-orchestrator", p_clean),
+            node_kind: "gate".to_string(),
+            provider: "jev".to_string(),
+            model: "jev-latest".to_string(),
+            role: "🎯 Jev System-1 Gate".to_string(),
+            status: "DecisionGate".to_string(),
+            execution_step: 4,
+            prompt: format!("Evaluate System-1 decision primitives (Noul, Choice, Score) for {}", p_clean),
+            thinking: "Sub-200ms TypeSafe AI System-1 evaluation over quantized state.".to_string(),
+            context: format!("Model Class: DECISION_SYSTEM_1\nSLA: <200ms • Fail-Closed Safety\nWorkspace: ~/code/{}", p_clean),
+            recent_log: "NOUL: 0.92 • CHOICE: allow_execution • SCORE: high".to_string(),
+            tokens: TokenMetrics {
+                input_tokens: 420,
+                cache_read_tokens: 380,
+                output_tokens: 48,
+            },
+            tool_calls: vec![ToolCall {
+                name: "jev_evaluate_primitives".to_string(),
+                summary: "Evaluated {noul, choice, score} in 18ms".to_string(),
+                status: "Completed".to_string(),
+            }],
+            outputs: vec![
+                "NOUL (Safety Confidence): 0.92\nCHOICE (Routing Action): allow_execution\nSCORE (Invariant Rubric): high_compliance (0.94)".to_string(),
+            ],
+            x: 220.0,
+            y: 340.0,
+            council_score: Some(9.4),
+            is_council_winner: false,
+            decision_eval: Some(DecisionEvaluation {
+                engine: "jev-latest (TypeSafe System-1)".to_string(),
+                noul_risk_prob: 0.08,
+                choice_action: "allow_execution".to_string(),
+                score_rubric: "high_compliance".to_string(),
+                confidence: 0.94,
+                gate_status: "ALLOW_EXECUTION".to_string(),
+                latency_ms: 18,
+                primitives: vec![
+                    DecisionPrimitive {
+                        key: "regression_risk_noul".to_string(),
+                        primitive_type: "noul".to_string(),
+                        value: "0.08".to_string(),
+                        numeric_value: Some(0.08),
+                        confidence: 0.95,
+                        description: "Probability of invariant regression or unsafe side-effect".to_string(),
+                    },
+                    DecisionPrimitive {
+                        key: "execution_route_choice".to_string(),
+                        primitive_type: "choice".to_string(),
+                        value: "allow_execution".to_string(),
+                        numeric_value: None,
+                        confidence: 0.94,
+                        description: "Discrete System-1 gate routing decision".to_string(),
+                    },
+                    DecisionPrimitive {
+                        key: "architecture_alignment_score".to_string(),
+                        primitive_type: "score".to_string(),
+                        value: "high_compliance (0.94)".to_string(),
+                        numeric_value: Some(0.94),
+                        confidence: 0.93,
+                        description: "Ordinal rubric score against project boundary rules".to_string(),
+                    },
+                ],
+            }),
+            interactive_prompt: None,
+        },
+        AgentNode {
+            agent_id: format!("{}-verifier", p_clean),
+            parent_id: format!("{}-orchestrator", p_clean),
+            node_kind: "subagent".to_string(),
+            provider: "claude".to_string(),
+            model: "claude-4-sonnet".to_string(),
+            role: "Adversarial Verifier".to_string(),
+            status: "AwaitingToolApproval".to_string(),
+            execution_step: 6,
+            prompt: "Run zero-trust verification gate on candidate changes.".to_string(),
+            thinking: "Checking boundary invariants and memory allocations.".to_string(),
+            context: format!("Gate: Zero-Trust Disproof in ~/code/{}", p_clean),
+            recent_log: "Pending approval: cargo test --release".to_string(),
+            tokens: TokenMetrics {
+                input_tokens: 6100,
+                cache_read_tokens: 4000,
+                output_tokens: 310,
+            },
+            tool_calls: vec![ToolCall {
+                name: "run_command".to_string(),
+                summary: "cargo test --release".to_string(),
+                status: "Pending".to_string(),
+            }],
+            outputs: vec![],
+            x: 460.0,
+            y: 340.0,
+            council_score: None,
+            is_council_winner: false,
+            decision_eval: None,
+            interactive_prompt: None,
+        },
+        AgentNode {
+            agent_id: format!("{}-worker", p_clean),
+            parent_id: format!("{}-orchestrator", p_clean),
+            node_kind: "task".to_string(),
+            provider: "codex".to_string(),
+            model: "TASK • task-1".to_string(),
+            role: "cargo test --release".to_string(),
+            status: "Running".to_string(),
+            execution_step: 9,
+            prompt: "Optimize hot-path allocations and binary framing.".to_string(),
+            thinking: "Replaced dynamic heap allocations with bounded ring buffers.".to_string(),
+            context: format!("Path: ~/code/{}/src", p_clean),
+            recent_log: "Zero-allocation pass verified.".to_string(),
+            tokens: TokenMetrics {
+                input_tokens: 4800,
+                cache_read_tokens: 2100,
+                output_tokens: 520,
+            },
+            tool_calls: vec![],
+            outputs: vec!["All benchmarks passed (<1ms frame time)".to_string()],
+            x: 700.0,
+            y: 340.0,
+            council_score: None,
+            is_council_winner: false,
+            decision_eval: None,
+            interactive_prompt: None,
+        },
+    ]
+}
