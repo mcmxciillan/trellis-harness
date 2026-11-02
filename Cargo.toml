@@ -1,0 +1,25 @@
+[package]
+name = "exo-suit"
+version = "0.2.0"
+edition = "2021"
+description = "Ultra-Lean Multi-Provider AI Harness & Council Engine (Rust Daemon + Embedded Canvas PWA)"
+
+[[bin]]
+name = "exo-suit"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws", "macros"] }
+tokio = { version = "1.39", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+notify = "6.1"
+futures-util = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
