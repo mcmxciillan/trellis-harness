@@ -1,4 +1,4 @@
-use crate::brain::{clean_ansi_and_tags, parse_ask_question_args, sanitize_code_path};
+use crate::brain::{clean_ansi_and_tags, home_dir, parse_ask_question_args, sanitize_code_path};
 use crate::models::{
     DecisionEvaluation, DecisionPrimitive, InteractiveQuestionItem, ProviderInfo,
 };
@@ -11,9 +11,14 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 
 pub fn detect_binary(candidates: &[&str]) -> Option<String> {
+    let local_bin = home_dir().join(".local").join("bin");
     for &c in candidates {
         if Path::new(c).exists() {
             return Some(c.to_string());
+        }
+        let user_local = local_bin.join(c);
+        if user_local.exists() {
+            return Some(user_local.to_string_lossy().to_string());
         }
         if let Ok(output) = std::process::Command::new("which").arg(c).output() {
             if output.status.success() {
@@ -28,12 +33,8 @@ pub fn detect_binary(candidates: &[&str]) -> Option<String> {
 }
 
 pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<ProviderInfo> {
-    let agy_bin = detect_binary(&["/Users/coreymcmillan/.local/bin/agy", "agy"]);
-    let claude_bin = detect_binary(&[
-        "/Users/coreymcmillan/.local/bin/claude",
-        "/opt/homebrew/bin/claude",
-        "claude",
-    ]);
+    let agy_bin = detect_binary(&["agy"]);
+    let claude_bin = detect_binary(&["/opt/homebrew/bin/claude", "claude"]);
     let codex_bin = detect_binary(&["/opt/homebrew/bin/codex", "codex"]);
     let gh_bin = detect_binary(&["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "gh"]);
 
@@ -743,7 +744,7 @@ pub async fn execute_provider_prompt(
     }
 
     if provider_id == "antigravity" && !fast_council_stage {
-        if let Some(agy_bin) = detect_binary(&["/Users/coreymcmillan/.local/bin/agy", "agy"]) {
+        if let Some(agy_bin) = detect_binary(&["agy"]) {
             let mut cmd = Command::new(&agy_bin);
             cmd.arg("-p")
                 .arg(&contextualized_prompt)

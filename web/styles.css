@@ -2896,3 +2896,93 @@ dialog::backdrop {
   background: var(--terracotta-tint);
 }
 
+/* ==========================================================================
+   "+ New Session / New Greenfield Project" Topbar Button & Dialog
+   ========================================================================== */
+.new-session-pill {
+  background: var(--terracotta);
+  color: #FFFDF9;
+  border: 1.5px solid var(--terracotta-strong);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-family: var(--font-display);
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(168, 32, 42, 0.22);
+  transition: all 0.15s ease;
+}
+
+.new-session-pill:hover {
+  background: var(--terracotta-strong);
+  color: #FFFDF9;
+  transform: translateY(-0.5px);
+}
+
+.new-session-form {
+  display: flex;
+  flex-direction: column;
+}
+
+.new-session-error {
+  background: rgba(168, 32, 42, 0.1);
+  border: 1.5px solid #A8202A;
+  color: #A8202A;
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+.new-session-error.hidden {
+  display: none;
+}
+
+.new-session-textarea {
+  background: var(--bg-well);
+  color: var(--text-main);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.new-session-textarea:focus {
+  outline: none;
+  border-color: var(--terracotta);
+}
+
+.new-session-checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-well);
+  cursor: pointer;
+  margin-bottom: 6px;
+  transition: border-color 0.14s ease, background-color 0.14s ease;
+}
+
+.new-session-checkbox-row:hover {
+  border-color: var(--terracotta);
+  background: var(--bg-card-hover);
+}
+
+.new-session-checkbox-row input[type="checkbox"] {
+  accent-color: #A8202A;
+  inline-size: 16px;
+  block-size: 16px;
+  margin-top: 2px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+

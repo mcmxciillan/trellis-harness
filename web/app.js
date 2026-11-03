@@ -65,6 +65,8 @@
     devopsMainOpen: false,
     devopsActiveTab: "diff",
     selectedDiffFile: null,
+    availableProjects: [],
+    newSessionMode: "existing_repo",
   };
 
   // DOM Elements
@@ -311,6 +313,39 @@
       renderSessionsDropdown();
     }
 
+    if (pkt.available_projects) {
+      state.availableProjects = pkt.available_projects;
+      populateNewSessionRepoDropdown();
+    }
+
+    if (pkt.type === "SESSION_CREATED") {
+      const dlg = document.getElementById("new-session-dialog");
+      if (dlg && dlg.open) {
+        dlg.close();
+      }
+      if (pkt.provision && pkt.provision.session_id && pkt.provision.title) {
+        state.sessionAliases[pkt.provision.session_id] = pkt.provision.title;
+        try {
+          localStorage.setItem(
+            "trellis.sessionAliases.v1",
+            JSON.stringify(state.sessionAliases)
+          );
+        } catch {
+          // ignore storage quota errors
+        }
+      }
+      renderSessionsDropdown();
+      switchTab("chat");
+    }
+
+    if (pkt.type === "SESSION_CREATE_ERROR") {
+      const errBanner = document.getElementById("new-session-error");
+      if (errBanner) {
+        errBanner.textContent = `⚠️ ${pkt.error || "Failed to create session."}`;
+        errBanner.classList.remove("hidden");
+      }
+    }
+
     if (pkt.skills || pkt.tools) {
       if (pkt.skills) state.skills = pkt.skills;
       if (pkt.tools) state.tools = pkt.tools;
@@ -545,7 +580,7 @@
       sendCommand({
         command: "OPEN_GIT_DIFF",
         project_id: state.activeProject,
-        file_path: state.selectedDiffFile || undefined,
+        path: state.selectedDiffFile || undefined,
       });
     } else {
       requestDraw();
@@ -3950,15 +3985,15 @@
     const git = devops.git || {};
     const branch = git.branch || "main";
     const fileCount = (git.changed_files || []).length;
+    const totalAdd = git.total_additions ?? git.total_insertions ?? 0;
+    const totalDel = git.total_deletions ?? 0;
     gitBtn.classList.remove("clean", "dirty", "failed");
     if (git.is_clean) {
       gitBtn.classList.add("clean");
       gitBtn.textContent = `🔀 ${branch} • clean`;
     } else {
       gitBtn.classList.add("dirty");
-      gitBtn.textContent = `🔀 ${branch} • ±${fileCount} (+${git.total_insertions || 0}/-${
-        git.total_deletions || 0
-      })`;
+      gitBtn.textContent = `🔀 ${branch} • ±${fileCount} (+${totalAdd}/-${totalDel})`;
     }
 
     // 2. Anchor Test Gate Pill
@@ -3978,8 +4013,10 @@
     }
 
     // 3. Deploy & Health Pill
-    const dep = devops.deploy || {};
-    const healthyEndpoints = (dep.endpoints || []).filter((e) => e.ok).length;
+    const dep = devops.deploy_health || devops.deploy || {};
+    const healthyEndpoints = (dep.endpoints || []).filter(
+      (e) => e.ok || e.status === "HEALTHY" || e.status_code === 200
+    ).length;
     const totalEndpoints = (dep.endpoints || []).length;
     deployBtn.classList.remove("clean", "passed", "dirty", "failed");
     if (dep.release_ready) {
@@ -4056,15 +4093,17 @@
     const tab = state.devopsActiveTab || "diff";
     const git = devops.git || {};
     const tests = devops.tests || {};
-    const deploy = devops.deploy || {};
+    const deploy = devops.deploy_health || devops.deploy || {};
     const changedFiles = git.changed_files || [];
+    const totalAdd = git.total_additions ?? git.total_insertions ?? 0;
+    const totalDel = git.total_deletions ?? 0;
 
     let bodyHtml = "";
     if (tab === "diff") {
       const diffPayload = state.gitDiff;
       const diffText =
         diffPayload && diffPayload.project_id === state.activeProject
-          ? diffPayload.diff_text
+          ? diffPayload.unified_diff || diffPayload.diff_text || ""
           : "";
       const activeFile = state.selectedDiffFile || null;
 
@@ -4083,14 +4122,12 @@
               <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);">
                 Branch: <strong style="color:var(--text-main);">${escapeHtml(
                   git.branch || "main"
-                )}</strong> • <span class="diff-stat-add">+${
-        git.total_insertions || 0
-      }</span> / <span class="diff-stat-del">-${git.total_deletions || 0}</span>
+                )}</strong> • <span class="diff-stat-add">+${totalAdd}</span> / <span class="diff-stat-del">-${totalDel}</span>
               </div>
               <div style="display:flex;flex-direction:column;gap:5px;max-block-size:290px;overflow-y:auto;">
                 ${
                   changedFiles.length === 0
-                    ? `<div style="font-size:11.5px;color:var(--moss-strong);padding:8px;background:var(--moss-tint);border-radius:8px;">✓ Working tree is clean. Showing latest commit diff.</div>`
+                    ? `<div style="font-size:11.5px;color:var(--moss-strong);padding:8px;background:var(--moss-tint);border-radius:8px;">✓ Working tree is clean. Showing latest HEAD commit diff on right.</div>`
                     : changedFiles
                         .map((f) => {
                           const stCode = f.status || "M";
@@ -4101,6 +4138,8 @@
                               ? "del"
                               : "mod";
                           const isSel = activeFile === f.path;
+                          const fAdd = f.additions ?? f.insertions ?? 0;
+                          const fDel = f.deletions ?? 0;
                           return `
                             <div class="diff-file-item ${isSel ? "active" : ""}" data-diff-file="${escapeAttr(
                             f.path
@@ -4112,8 +4151,8 @@
                                 )}">${escapeHtml(f.path)}</span>
                               </div>
                               <div style="display:flex;align-items:center;gap:5px;flex-shrink:0;">
-                                <span class="diff-stat-add">+${f.insertions || 0}</span>
-                                <span class="diff-stat-del">-${f.deletions || 0}</span>
+                                <span class="diff-stat-add">+${fAdd}</span>
+                                <span class="diff-stat-del">-${fDel}</span>
                               </div>
                             </div>
                           `;
@@ -4134,7 +4173,7 @@
                     <div style="padding:6px 8px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:8px;font-size:11px;">
                       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
                         <code style="color:var(--terracotta-strong);font-weight:700;">${escapeHtml(
-                          c.short_hash
+                          c.sha || c.short_hash || ""
                         )}</code>
                         <span style="font-size:10px;color:var(--text-muted);">${escapeHtml(
                           c.relative_time
@@ -4249,7 +4288,8 @@
               Anchor Test Runner Output Stream
             </div>
             <div class="test-terminal-box">${escapeHtml(
-              tests.output_tail ||
+              tests.output_excerpt ||
+                tests.output_tail ||
                 "Click '▶ Run Anchor Tests Now' to execute the deterministic test suite for ~/code/" +
                   state.activeProject +
                   ".\nWhile running, a live capsule node will appear on the Agent Graph and can be cancelled at any time with ⏹ STOP."
@@ -4266,14 +4306,21 @@
           };">
             <div>
               <div style="font-family:var(--font-display);font-size:15px;font-weight:800;color:var(--text-main);">
-                ${escapeHtml(deploy.release_summary || "Release Readiness Gate")}
+                ${escapeHtml(
+                  deploy.release_summary ||
+                    (deploy.release_ready
+                      ? "✓ Release Gate READY — Working Tree Clean & Endpoints Healthy"
+                      : "⚠ Release Gate HOLD — Uncommitted Changes or Pending Verification")
+                )}
               </div>
               <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
                 Workspace: <code>~/code/${escapeHtml(
                   state.activeProject
                 )}</code> • Branch: <code>${escapeHtml(git.branch || "main")}</code> (↑${
         git.ahead || 0
-      } ↓${git.behind || 0})
+      } ↓${git.behind || 0}) ${
+        deploy.checked_at ? `• Checked: ${escapeHtml(deploy.checked_at)}` : ""
+      }
               </div>
             </div>
             <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -4302,8 +4349,10 @@
                   (deploy.endpoints || []).length === 0
                     ? `<div style="font-size:12px;color:var(--text-muted);">No endpoints configured.</div>`
                     : (deploy.endpoints || [])
-                        .map(
-                          (ep) => `
+                        .map((ep) => {
+                          const isOk =
+                            ep.ok || ep.status === "HEALTHY" || ep.status_code === 200;
+                          return `
                           <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;">
                             <div>
                               <div style="font-weight:700;font-size:12.5px;color:var(--text-main);">${escapeHtml(
@@ -4314,16 +4363,16 @@
                               )}</div>
                             </div>
                             <div style="text-align:right;">
-                              <span class="badge ${ep.ok ? "completed" : "awaiting"}">
-                                ${ep.ok ? `✓ ${ep.status_code} OK` : "✕ UNREACHABLE"}
+                              <span class="badge ${isOk ? "completed" : "awaiting"}">
+                                ${isOk ? `✓ ${ep.status_code} OK` : "✕ UNREACHABLE"}
                               </span>
                               <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted);margin-top:3px;">
                                 ${ep.latency_ms}ms
                               </div>
                             </div>
                           </div>
-                        `
-                        )
+                        `;
+                        })
                         .join("")
                 }
               </div>
@@ -4334,18 +4383,14 @@
                 🐙 GitHub PR &amp; CI Workflow Telemetry
               </div>
               ${
-                deploy.open_pr_number
+                deploy.pr_summary || deploy.open_pr_number
                   ? `<div style="padding:10px 12px;background:var(--moss-tint);border:1px solid var(--moss);border-radius:10px;font-size:12px;">
-                      <div style="font-weight:800;color:var(--moss-strong);">PR #${
-                        deploy.open_pr_number
-                      }: ${escapeHtml(deploy.open_pr_title || "")}</div>
-                      ${
-                        deploy.open_pr_url
-                          ? `<a href="${escapeAttr(
-                              deploy.open_pr_url
-                            )}" target="_blank" rel="noopener" class="md-link" style="font-size:11px;">Open Pull Request on GitHub ↗</a>`
-                          : ""
-                      }
+                      <div style="font-weight:800;color:var(--moss-strong);">${escapeHtml(
+                        deploy.pr_summary ||
+                          `PR #${deploy.open_pr_number}: ${deploy.open_pr_title || ""}`
+                      )} ${
+                      deploy.pr_state ? `[${escapeHtml(deploy.pr_state)}]` : ""
+                    }</div>
                     </div>`
                   : `<div style="font-size:11.5px;color:var(--text-muted);padding:8px;background:var(--bg-well);border-radius:8px;">No open GitHub PR detected for current branch.</div>`
               }
@@ -4446,7 +4491,7 @@
       sendCommand({
         command: "OPEN_GIT_DIFF",
         project_id: state.activeProject,
-        file_path: state.selectedDiffFile || undefined,
+        path: state.selectedDiffFile || undefined,
       });
     });
 
@@ -4462,7 +4507,7 @@
         sendCommand({
           command: "OPEN_GIT_DIFF",
           project_id: state.activeProject,
-          file_path: fp || undefined,
+          path: fp || undefined,
         });
       });
     });
@@ -4494,7 +4539,11 @@
     });
 
     container.querySelector("#devops-fix-tests-btn")?.addEventListener("click", () => {
-      const failTail = (state.devops?.tests?.output_tail || "").slice(-1200);
+      const failTail = (
+        state.devops?.tests?.output_excerpt ||
+        state.devops?.tests?.output_tail ||
+        ""
+      ).slice(-1200);
       const prompt = `/bushog Fix the failing deterministic anchor tests in ~/code/${state.activeProject}.\n\nRecent test runner failure output:\n\`\`\`\n${failTail}\n\`\`\``;
       setDevOpsMainOpen(false);
       triggerLifecycleWorkflow(prompt, true);
@@ -4511,6 +4560,153 @@
       });
     });
   }
+
+  // =========================================================================
+  // 8. "+ New Session / New Greenfield Project" Provisioning Modal
+  // =========================================================================
+  const newSessionBtn = document.getElementById("new-session-btn");
+  const newSessionDialog = document.getElementById("new-session-dialog");
+  const closeNewSessionBtn = document.getElementById("close-new-session-btn");
+  const cancelNewSessionBtn = document.getElementById("cancel-new-session-btn");
+  const newSessionForm = document.getElementById("new-session-form");
+  const newModeExistingBtn = document.getElementById("new-mode-existing-btn");
+  const newModeProjectBtn = document.getElementById("new-mode-project-btn");
+  const newExistingRepoFields = document.getElementById("new-existing-repo-fields");
+  const newGreenfieldProjectFields = document.getElementById("new-greenfield-project-fields");
+  const newSessionRepoSelect = document.getElementById("new-session-repo-select");
+  const newProjectSlugInput = document.getElementById("new-project-slug-input");
+  const newProjectDescInput = document.getElementById("new-project-desc-input");
+  const newProjectInitGit = document.getElementById("new-project-init-git");
+  const newSessionTitleInput = document.getElementById("new-session-title-input");
+  const newSessionAutoKickoff = document.getElementById("new-session-auto-kickoff");
+  const newSessionError = document.getElementById("new-session-error");
+  const submitNewSessionBtn = document.getElementById("submit-new-session-btn");
+
+  function populateNewSessionRepoDropdown() {
+    if (!newSessionRepoSelect) return;
+    const projects =
+      state.availableProjects && state.availableProjects.length > 0
+        ? state.availableProjects
+        : [state.activeProject || "exo-suit"];
+    newSessionRepoSelect.innerHTML = "";
+    for (const slug of projects) {
+      const opt = document.createElement("option");
+      opt.value = slug;
+      opt.selected = slug === state.activeProject;
+      opt.textContent = `~/code/${slug}`;
+      newSessionRepoSelect.appendChild(opt);
+    }
+  }
+
+  function setNewSessionDialogMode(mode) {
+    state.newSessionMode = mode === "new_project" ? "new_project" : "existing_repo";
+    const isNewProj = state.newSessionMode === "new_project";
+    newModeExistingBtn?.classList.toggle("active", !isNewProj);
+    newModeProjectBtn?.classList.toggle("active", isNewProj);
+    newExistingRepoFields?.classList.toggle("hidden", isNewProj);
+    newGreenfieldProjectFields?.classList.toggle("hidden", !isNewProj);
+    newSessionError?.classList.add("hidden");
+    if (submitNewSessionBtn) {
+      submitNewSessionBtn.textContent = isNewProj
+        ? "🌱 CREATE PROJECT & SESSION ➔"
+        : "+ CREATE SESSION ➔";
+    }
+    if (isNewProj && newSessionAutoKickoff) {
+      newSessionAutoKickoff.checked = true;
+    }
+    if (isNewProj) {
+      newProjectSlugInput?.focus();
+    } else {
+      newSessionTitleInput?.focus();
+    }
+  }
+
+  newSessionBtn?.addEventListener("click", () => {
+    if (!newSessionDialog) return;
+    populateNewSessionRepoDropdown();
+    if (newProjectSlugInput) newProjectSlugInput.value = "";
+    if (newProjectDescInput) newProjectDescInput.value = "";
+    if (newSessionTitleInput) newSessionTitleInput.value = "";
+    if (newProjectInitGit) newProjectInitGit.checked = true;
+    if (newSessionAutoKickoff) newSessionAutoKickoff.checked = false;
+    setNewSessionDialogMode("existing_repo");
+    newSessionDialog.showModal();
+  });
+
+  closeNewSessionBtn?.addEventListener("click", () => {
+    newSessionDialog?.close();
+  });
+
+  cancelNewSessionBtn?.addEventListener("click", () => {
+    newSessionDialog?.close();
+  });
+
+  if (newSessionDialog && !("closedBy" in HTMLDialogElement.prototype)) {
+    newSessionDialog.addEventListener("click", (event) => {
+      if (event.target !== newSessionDialog) return;
+      const rect = newSessionDialog.getBoundingClientRect();
+      const inside =
+        rect.top <= event.clientY &&
+        event.clientY <= rect.top + rect.height &&
+        rect.left <= event.clientX &&
+        event.clientX <= rect.left + rect.width;
+      if (!inside) newSessionDialog.close();
+    });
+  }
+
+  newModeExistingBtn?.addEventListener("click", () => {
+    setNewSessionDialogMode("existing_repo");
+  });
+
+  newModeProjectBtn?.addEventListener("click", () => {
+    setNewSessionDialogMode("new_project");
+  });
+
+  newSessionForm?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    newSessionError?.classList.add("hidden");
+
+    const isNewProj = state.newSessionMode === "new_project";
+    const targetSlug = isNewProj
+      ? (newProjectSlugInput?.value || "").trim()
+      : (newSessionRepoSelect?.value || state.activeProject || "").trim();
+
+    if (!targetSlug) {
+      if (newSessionError) {
+        newSessionError.textContent = isNewProj
+          ? "⚠️ Please enter a valid project directory slug (e.g. pulse-engine)."
+          : "⚠️ Please select a target repository.";
+        newSessionError.classList.remove("hidden");
+      }
+      return;
+    }
+
+    if (isNewProj && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(targetSlug)) {
+      if (newSessionError) {
+        newSessionError.textContent =
+          "⚠️ Project slug must start with a letter or number and contain only letters, numbers, hyphens (-), or underscores (_).";
+        newSessionError.classList.remove("hidden");
+      }
+      return;
+    }
+
+    const customTitle = (newSessionTitleInput?.value || "").trim();
+    const projDesc = (newProjectDescInput?.value || "").trim();
+    const initGit = isNewProj ? Boolean(newProjectInitGit?.checked) : false;
+    const autoKickoff = Boolean(newSessionAutoKickoff?.checked);
+
+    sendCommand({
+      command: "CREATE_SESSION_OR_PROJECT",
+      mode: state.newSessionMode,
+      project_id: targetSlug,
+      title: customTitle || undefined,
+      description: projDesc || undefined,
+      init_git: initGit,
+      auto_kickoff: autoKickoff,
+      provider: state.selectedProvider,
+      model: state.selectedModel,
+    });
+  });
 
   // Initialize
   renderAtelierLeftRail();

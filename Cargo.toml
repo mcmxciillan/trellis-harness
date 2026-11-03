@@ -2,7 +2,16 @@
 name = "exo-suit"
 version = "0.2.0"
 edition = "2021"
-description = "Ultra-Lean Multi-Provider AI Harness & Council Engine (Rust Daemon + Embedded Canvas PWA)"
+description = "Trellis AI Harness — Single-Binary Multi-Provider AI Orchestrator, 3-Stage Borda Council Engine & Developer Lifecycle Cockpit"
+license = "MIT"
+repository = "https://github.com/mcmxciillan/trellis-harness"
+readme = "README.md"
+keywords = ["ai", "agents", "orchestration", "devtools", "harness"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
+
+[lib]
+name = "exo_suit"
+path = "src/lib.rs"
 
 [[bin]]
 name = "exo-suit"

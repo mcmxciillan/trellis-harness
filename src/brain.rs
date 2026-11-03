@@ -1,7 +1,7 @@
 use crate::models::{
     AgentNode, ArtifactItem, ChatMessage, DecisionEvaluation, DecisionPrimitive, ExecutionScope,
     FileEntry, FileTreeInfo, InteractivePrompt, InteractiveQuestionItem, OpenedFile, SessionItem,
-    SkillItem, TokenMetrics, ToolCall, ToolCatalogItem,
+    SessionProvisionResult, SkillItem, TokenMetrics, ToolCall, ToolCatalogItem,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -12,7 +12,7 @@ use std::time::UNIX_EPOCH;
 pub fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/Users/coreymcmillan"))
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 pub fn brain_dir() -> PathBuf {
@@ -1220,10 +1220,16 @@ pub fn get_session_chat_thread(session_id: &str) -> Vec<ChatMessage> {
                             .trim_matches('"')
                         };
 
+                        let code_root_prefix = format!("{}/", code_root_dir().to_string_lossy());
+                        let exo_prefix = format!("{}exo-suit/", code_root_prefix);
+                        let agy_prefix = format!(
+                            "{}/.gemini/antigravity-cli/",
+                            home_dir().to_string_lossy()
+                        );
                         let clean_summary = raw_summary
-                            .replace("/Users/coreymcmillan/code/exo-suit/", "")
-                            .replace("/Users/coreymcmillan/code/", "")
-                            .replace("/Users/coreymcmillan/.gemini/antigravity-cli/", "~/.gemini/")
+                            .replace(&exo_prefix, "")
+                            .replace(&code_root_prefix, "")
+                            .replace(&agy_prefix, "~/.gemini/")
                             .chars()
                             .take(78)
                             .collect::<String>();
@@ -1650,9 +1656,12 @@ fn parse_session_node_recursive(
                     }
                 }
 
-                // 2. Check if this step launched a background task
-                if let Some(pos) = c.find("Tool is running as a background task with task id:") {
-                    let after = &c[pos + "Tool is running as a background task with task id:".len()..];
+                // 2. Check if this step launched one or more background tasks
+                let marker = "Tool is running as a background task with task id:";
+                let mut task_search = c;
+                while let Some(pos) = task_search.find(marker) {
+                    let after = &task_search[pos + marker.len()..];
+                    task_search = after;
                     let task_id: String = after
                         .trim_start()
                         .chars()
@@ -2148,3 +2157,312 @@ pub fn fallback_project_graph(project_name: &str) -> Vec<AgentNode> {
         },
     ]
 }
+
+/// Declarative sandbox guard for project slugs inside `~/code/<slug>`.
+/// Rejects empty strings, `.` / `..`, path separators, leading dots, or characters outside `[a-zA-Z0-9_-]`.
+pub fn validate_project_slug(raw_slug: &str) -> Result<String, String> {
+    let trimmed = raw_slug.trim();
+    if trimmed.is_empty() {
+        return Err("Project slug cannot be empty.".to_string());
+    }
+    if trimmed.len() > 64 {
+        return Err("Project slug must be 64 characters or fewer.".to_string());
+    }
+    if trimmed.starts_with('.') || trimmed.starts_with('-') {
+        return Err("Project slug must start with an alphanumeric character.".to_string());
+    }
+    if trimmed.contains("..") || trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("Project slug cannot contain path separators or '..'.".to_string());
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(
+            "Project slug may only contain letters, numbers, hyphens (-), and underscores (_)."
+                .to_string(),
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Lists all valid top-level project directory names in `~/code/*`.
+pub fn list_workspace_projects() -> Vec<String> {
+    let root = code_root_dir();
+    let mut projects = Vec::new();
+    if let Ok(rd) = fs::read_dir(&root) {
+        for entry in rd.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with('.') && validate_project_slug(&name).is_ok() {
+                projects.push(name);
+            }
+        }
+    }
+    projects.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    projects
+}
+
+fn generate_new_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1_700_000_000_000_000_000);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let p1 = (now_nanos >> 32) as u32;
+    let p2 = ((now_nanos >> 16) & 0xFFFF) as u16;
+    let p3 = (0x4000 | (now_nanos & 0x0FFF)) as u16;
+    let p4 = (0x8000 | (seq & 0x3FFF)) as u16;
+    let p5 = (now_nanos ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & 0xFFFF_FFFF_FFFF;
+    format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", p1, p2, p3, p4, p5)
+}
+
+/// Core deep-module implementation for provisioning either:
+/// - `"existing_repo"`: A fresh session bound to an existing directory in `code_root/<slug>`
+/// - `"new_project"`: A brand-new greenfield project directory in `code_root/<slug>` (with optional `git init -b main` + `.gitignore` + `README.md`) plus a bound session in `brain_root/<session_id>`.
+pub fn provision_workspace_and_session_in_roots(
+    code_root: &Path,
+    brain_root: &Path,
+    mode: &str,
+    raw_project_slug: &str,
+    raw_title: Option<&str>,
+    raw_description: Option<&str>,
+    init_git: bool,
+) -> Result<SessionProvisionResult, String> {
+    let slug = validate_project_slug(raw_project_slug)?;
+    let workspace_dir = code_root.join(&slug);
+    let is_new_project_mode = mode == "new_project";
+
+    let mut created_new_project = false;
+    let mut git_initialized = false;
+
+    if is_new_project_mode {
+        if !workspace_dir.exists() {
+            fs::create_dir_all(&workspace_dir)
+                .map_err(|e| format!("Failed to create ~/code/{}: {}", slug, e))?;
+            created_new_project = true;
+        }
+
+        let desc_clean = raw_description
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty())
+            .unwrap_or("Greenfield project initialized via Trellis AI Harness.");
+
+        let readme_path = workspace_dir.join("README.md");
+        if !readme_path.exists() {
+            let readme_body = format!(
+                "# {}\n\n{}\n\n## Architecture & Development\nManaged with the Trellis AI Harness (`exo-suit`).\n",
+                slug, desc_clean
+            );
+            let _ = fs::write(&readme_path, readme_body);
+        }
+
+        let gitignore_path = workspace_dir.join(".gitignore");
+        if !gitignore_path.exists() {
+            let gitignore_body = "/target/\n/node_modules/\n/.next/\n/dist/\n.DS_Store\n.env\n.env.local\n*.log\n";
+            let _ = fs::write(&gitignore_path, gitignore_body);
+        }
+
+        if init_git && !workspace_dir.join(".git").exists() {
+            let init_ok = std::process::Command::new("git")
+                .args(["init", "-b", "main"])
+                .current_dir(&workspace_dir)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if init_ok {
+                let _ = std::process::Command::new("git")
+                    .args(["add", "."])
+                    .current_dir(&workspace_dir)
+                    .output();
+                let _ = std::process::Command::new("git")
+                    .args([
+                        "commit",
+                        "-m",
+                        &format!("chore: initialize {} greenfield workspace", slug),
+                    ])
+                    .current_dir(&workspace_dir)
+                    .output();
+                git_initialized = true;
+            }
+        } else if workspace_dir.join(".git").exists() {
+            git_initialized = true;
+        }
+    } else if !workspace_dir.is_dir() {
+        return Err(format!(
+            "Workspace directory ~/code/{} does not exist. Switch to 'New Greenfield Project' to create it.",
+            slug
+        ));
+    } else {
+        git_initialized = workspace_dir.join(".git").exists();
+    }
+
+    // Generate & persist the new session inside `brain_root/<session_id>`
+    let session_id = generate_new_session_id();
+    let session_dir = brain_root.join(&session_id);
+    let logs_dir = session_dir.join(".system_generated").join("logs");
+    fs::create_dir_all(&logs_dir)
+        .map_err(|e| format!("Failed to create session brain directory: {}", e))?;
+
+    let final_title = raw_title
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| {
+            if is_new_project_mode {
+                format!("{} — Greenfield Architecture", slug)
+            } else {
+                format!("{} — Workspace Session", slug)
+            }
+        });
+
+    fs::write(session_dir.join(".session_project.txt"), &slug)
+        .map_err(|e| format!("Failed to persist .session_project.txt: {}", e))?;
+    fs::write(session_dir.join(".session_title.txt"), &final_title)
+        .map_err(|e| format!("Failed to persist .session_title.txt: {}", e))?;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1_730_000_000);
+    let ts_str = format_epoch_secs(now_secs);
+
+    // Seed an initial SYSTEM step in transcript.jsonl so `get_past_sessions` indexes and orders it at the top immediately
+    let seed_step = serde_json::json!({
+        "step_index": 0,
+        "source": "SYSTEM",
+        "type": "SESSION_INITIALIZED",
+        "status": "DONE",
+        "created_at": ts_str,
+        "content": format!("Initialized session '{}' bound to {}", final_title, workspace_dir.display())
+    });
+    fs::write(
+        logs_dir.join("transcript.jsonl"),
+        format!("{}\n", seed_step),
+    )
+    .map_err(|e| format!("Failed to seed transcript.jsonl: {}", e))?;
+
+    Ok(SessionProvisionResult {
+        session_id,
+        project_id: slug,
+        title: final_title,
+        workspace_path: workspace_dir.to_string_lossy().to_string(),
+        created_new_project,
+        git_initialized,
+    })
+}
+
+/// Public entry point using the host's `~/code` and `~/.gemini/antigravity-cli/brain` roots.
+pub fn provision_workspace_and_session(
+    mode: &str,
+    raw_project_slug: &str,
+    raw_title: Option<&str>,
+    raw_description: Option<&str>,
+    init_git: bool,
+) -> Result<SessionProvisionResult, String> {
+    provision_workspace_and_session_in_roots(
+        &code_root_dir(),
+        &brain_dir(),
+        mode,
+        raw_project_slug,
+        raw_title,
+        raw_description,
+        init_git,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anchor_test_validate_project_slug_rejects_traversal_and_invalid_chars() {
+        assert_eq!(
+            validate_project_slug("pulse-engine").unwrap(),
+            "pulse-engine"
+        );
+        assert_eq!(validate_project_slug("exo_suit_2").unwrap(), "exo_suit_2");
+
+        assert!(validate_project_slug("").is_err());
+        assert!(validate_project_slug("   ").is_err());
+        assert!(validate_project_slug("..").is_err());
+        assert!(validate_project_slug("../etc").is_err());
+        assert!(validate_project_slug("foo/bar").is_err());
+        assert!(validate_project_slug(".hidden").is_err());
+        assert!(validate_project_slug("-dashstart").is_err());
+        assert!(validate_project_slug("space name").is_err());
+    }
+
+    #[test]
+    fn anchor_test_provision_new_session_and_greenfield_project() {
+        let tmp_base = std::env::temp_dir().join(format!(
+            "trellis_provision_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_base);
+        let code_root = tmp_base.join("code");
+        let brain_root = tmp_base.join("brain");
+        fs::create_dir_all(&code_root).unwrap();
+        fs::create_dir_all(&brain_root).unwrap();
+
+        // 1. Provision a brand-new greenfield project + session
+        let res = provision_workspace_and_session_in_roots(
+            &code_root,
+            &brain_root,
+            "new_project",
+            "nova-ledger",
+            Some("Nova Ledger Day-1 Spec"),
+            Some("Zero-copy financial ledger engine."),
+            true,
+        )
+        .expect("Greenfield project provisioning should succeed");
+
+        assert_eq!(res.project_id, "nova-ledger");
+        assert_eq!(res.title, "Nova Ledger Day-1 Spec");
+        assert!(res.created_new_project);
+        assert!(res.git_initialized);
+
+        let proj_dir = code_root.join("nova-ledger");
+        assert!(proj_dir.is_dir());
+        assert!(proj_dir.join("README.md").is_file());
+        assert!(proj_dir.join(".gitignore").is_file());
+        assert!(proj_dir.join(".git").is_dir());
+
+        let sess_dir = brain_root.join(&res.session_id);
+        assert_eq!(
+            fs::read_to_string(sess_dir.join(".session_project.txt")).unwrap(),
+            "nova-ledger"
+        );
+        assert_eq!(
+            fs::read_to_string(sess_dir.join(".session_title.txt")).unwrap(),
+            "Nova Ledger Day-1 Spec"
+        );
+        assert!(sess_dir
+            .join(".system_generated/logs/transcript.jsonl")
+            .is_file());
+
+        // 2. Provision a second session in the now-existing project
+        let res2 = provision_workspace_and_session_in_roots(
+            &code_root,
+            &brain_root,
+            "existing_repo",
+            "nova-ledger",
+            Some("Nova Bugfix Thread"),
+            None,
+            false,
+        )
+        .expect("Existing repo session provisioning should succeed");
+
+        assert_eq!(res2.project_id, "nova-ledger");
+        assert!(!res2.created_new_project);
+        assert_ne!(res.session_id, res2.session_id);
+
+        let _ = fs::remove_dir_all(&tmp_base);
+    }
+}
+

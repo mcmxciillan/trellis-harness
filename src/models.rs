@@ -255,6 +255,10 @@ pub struct ClientCommand {
     pub project_id: Option<String>,
     pub run_id: Option<String>,
     pub title: Option<String>,
+    pub mode: Option<String>,
+    pub description: Option<String>,
+    pub init_git: Option<bool>,
+    pub auto_kickoff: Option<bool>,
     pub artifact_name: Option<String>,
     pub agent_id: Option<String>,
     pub prompt: Option<String>,
@@ -264,6 +268,16 @@ pub struct ClientCommand {
     pub providers: Option<Vec<String>>,
     pub model: Option<String>,
     pub api_keys: Option<HashMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionProvisionResult {
+    pub session_id: String,
+    pub project_id: String,
+    pub title: String,
+    pub workspace_path: String,
+    pub created_new_project: bool,
+    pub git_initialized: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -2,3 +2,19 @@
 .DS_Store
 *.swp
 *.log
+
+# Environment & Secrets (Never Commit)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+*secret*.json
+
+# Local Agent & IDE State
+.claude/
+.gemini/
+.vscode/
+.idea/

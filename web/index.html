@@ -9,7 +9,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
   <title>Trellis — AI Harness (Structure for intelligence)</title>
-  <link rel="stylesheet" href="/styles.css?v=20261102i">
+  <link rel="stylesheet" href="/styles.css?v=20261102k">
 </head>
 <body>
   <div id="app-shell" class="app-shell left-collapsed">
@@ -47,6 +47,9 @@
           </select>
           <button id="rename-session-btn" class="icon-btn session-edit-btn" type="button" title="Rename selected session (or double-click session dropdown)" aria-label="Rename selected session">
             ✎
+          </button>
+          <button id="new-session-btn" class="icon-btn new-session-pill" type="button" title="Create a new session in an existing repo or bootstrap a new greenfield project">
+            + New
           </button>
           <div id="session-rename-inline" class="session-rename-inline hidden">
             <input id="session-rename-input" class="session-rename-input" type="text" maxlength="68" placeholder="Rename session…" aria-label="New session name" />
@@ -238,6 +241,111 @@
     </form>
   </dialog>
 
-  <script src="/app.js?v=20261102i"></script>
+  <!-- Light-Dismiss Dialog for "+ New Session / New Greenfield Project" -->
+  <dialog id="new-session-dialog" closedby="any" aria-labelledby="new-session-dialog-title">
+    <form id="new-session-form" class="new-session-form" novalidate>
+      <div class="card-header" style="margin-bottom: 10px;">
+        <div>
+          <h2 id="new-session-dialog-title" style="font-size: 15.5px; color: var(--text-main); font-family: var(--font-display); font-weight: 800;">
+            🌱 Create New Session or Greenfield Project
+          </h2>
+          <div style="font-size: 11.5px; color: var(--text-muted); margin-top: 2px;">
+            Start a clean conversation thread in an existing repository or bootstrap a brand-new project in <code>~/code/</code>.
+          </div>
+        </div>
+        <button type="button" id="close-new-session-btn" class="mini-btn">✕</button>
+      </div>
+
+      <div class="skills-segmented" role="tablist" style="display: grid; grid-template-columns: 1fr 1fr; margin-bottom: 14px;">
+        <button type="button" id="new-mode-existing-btn" class="skills-seg-btn active" data-new-mode="existing_repo">
+          📂 New Session in Existing Repo
+        </button>
+        <button type="button" id="new-mode-project-btn" class="skills-seg-btn" data-new-mode="new_project">
+          🌱 New Greenfield Project
+        </button>
+      </div>
+
+      <div id="new-session-error" class="new-session-error hidden" role="alert"></div>
+
+      <!-- Mode A: Existing Repo Selector -->
+      <div id="new-existing-repo-fields" class="key-field">
+        <label for="new-session-repo-select">Target Workspace Repository (<code>~/code/*</code>)</label>
+        <select id="new-session-repo-select" class="top-select" style="inline-size: 100%; padding: 9px 11px; font-size: 12.5px;"></select>
+      </div>
+
+      <!-- Mode B: New Greenfield Project Slug + Description -->
+      <div id="new-greenfield-project-fields" class="hidden">
+        <div class="key-field">
+          <label for="new-project-slug-input">New Project Directory Slug (<code>~/code/&lt;slug&gt;</code>)</label>
+          <input
+            id="new-project-slug-input"
+            type="text"
+            maxlength="64"
+            placeholder="e.g. pulse-engine, quantum-router, or atlas-api"
+            autocomplete="off"
+          />
+          <span style="font-size: 10.5px; color: var(--text-muted);">
+            Letters, numbers, hyphens (<code>-</code>), and underscores (<code>_</code>) only.
+          </span>
+        </div>
+
+        <div class="key-field">
+          <label for="new-project-desc-input">Project Vision / README Summary (Optional)</label>
+          <textarea
+            id="new-project-desc-input"
+            rows="2"
+            placeholder="Brief description of what this project does (written to README.md and passed to /greenfield-architecture)…"
+            class="new-session-textarea"
+          ></textarea>
+        </div>
+
+        <label class="new-session-checkbox-row" for="new-project-init-git">
+          <input id="new-project-init-git" type="checkbox" checked />
+          <div>
+            <div style="font-weight: 700; font-size: 12px; color: var(--text-main);">
+              Initialize Git Repository (<code>git init -b main</code> + <code>.gitignore</code> + <code>README.md</code>)
+            </div>
+            <div style="font-size: 11px; color: var(--text-muted);">
+              Creates the baseline commit automatically so the Live Git Diff &amp; Review Workbench is ready immediately.
+            </div>
+          </div>
+        </label>
+      </div>
+
+      <!-- Shared: Session Title -->
+      <div class="key-field" style="margin-top: 8px;">
+        <label for="new-session-title-input">Session Title (Optional)</label>
+        <input
+          id="new-session-title-input"
+          type="text"
+          maxlength="68"
+          placeholder="e.g. Day-1 Architecture Discovery, Auth Refactor, or Bug Hunt"
+          autocomplete="off"
+        />
+      </div>
+
+      <!-- Shared: Auto-Launch /greenfield-architecture Kickoff -->
+      <label class="new-session-checkbox-row" for="new-session-auto-kickoff" style="margin-top: 6px;">
+        <input id="new-session-auto-kickoff" type="checkbox" />
+        <div>
+          <div style="font-weight: 700; font-size: 12px; color: var(--terracotta-strong);">
+            📐 Auto-launch <code>/greenfield-architecture</code> kickoff prompt in the new session
+          </div>
+          <div style="font-size: 11px; color: var(--text-muted);">
+            Immediately dispatches the 8-Pillar architectural discovery workflow scoped to this session and workspace.
+          </div>
+        </div>
+      </label>
+
+      <div style="display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 16px;">
+        <button type="button" id="cancel-new-session-btn" class="icon-btn">Cancel</button>
+        <button type="submit" id="submit-new-session-btn" class="send-btn" style="min-block-size: 40px; padding: 0 20px; font-size: 12.5px;">
+          + CREATE SESSION ➔
+        </button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/app.js?v=20261102k"></script>
 </body>
 </html>

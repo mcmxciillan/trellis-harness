@@ -1686,14 +1686,16 @@ pub async fn run_council_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brain::{extract_project_slug_from_text, resolve_execution_scope};
+    use crate::brain::{code_root_dir, extract_project_slug_from_text, resolve_execution_scope};
 
     #[test]
     fn anchor_test_extract_and_resolve_execution_scope() {
-        let sample =
-            "Reading /Users/coreymcmillan/code/other-repo/src/lib.rs for workspace analysis";
+        let sample = format!(
+            "Reading {}/other-repo/src/lib.rs for workspace analysis",
+            code_root_dir().display()
+        );
         assert_eq!(
-            extract_project_slug_from_text(sample),
+            extract_project_slug_from_text(&sample),
             Some("other-repo".to_string())
         );
 

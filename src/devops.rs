@@ -238,6 +238,15 @@ pub fn compute_workspace_diff(project_id: &str, target_path: Option<&str>) -> Gi
                     );
                 }
             }
+        } else {
+            // Working tree is clean: show latest commit diff (`git show HEAD`) so reviewer can inspect latest commit
+            raw_diff = StdCommand::new("git")
+                .args(["show", "--stat", "--patch", "--unified=3", "HEAD"])
+                .current_dir(&work_dir)
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
         }
     }
 
@@ -316,7 +325,12 @@ pub fn parse_test_runner_counts(framework: &str, output: &str, exit_ok: bool) ->
             && (trimmed.contains(" passed") || trimmed.contains(" failed"))
         {
             for seg in trimmed.split(',') {
-                let s = seg.trim().trim_matches('=').trim();
+                let raw_seg = seg.trim().trim_matches('=').trim();
+                let s = raw_seg
+                    .split(" in ")
+                    .next()
+                    .unwrap_or(raw_seg)
+                    .trim();
                 if let Some(num_part) = s.strip_suffix("passed") {
                     let tok = num_part.split_whitespace().last().unwrap_or("0");
                     passed += tok.parse::<u32>().unwrap_or(0);
