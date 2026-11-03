@@ -14,34 +14,72 @@ use std::time::{Duration, Instant};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{broadcast, watch, RwLock};
 
+pub type DeployHealthSummary = DeployHealthSnapshot;
+pub type DevOpsCockpitSnapshot = WorkspaceDevOpsSnapshot;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestRunnerSpec {
+    pub framework: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub display_command: String,
+}
+
+static DEPLOY_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, (Instant, DeployHealthSummary)>>,
+> = std::sync::OnceLock::new();
+
 /// Tier 2 Declarative Policy Guard: Validates that `project_id` and optional `target_path`
-/// stay strictly inside the `~/code/<project_id>` workspace boundary and rejects traversal (`..`).
+/// stay strictly inside the `~/code/<project_id>` workspace boundary and rejects traversal (`..`)
+/// and symlink escapes outside the canonicalized workspace directory.
 pub fn validate_workspace_sandbox(
     project_id: &str,
     target_path: Option<&str>,
-) -> Option<(PathBuf, Option<String>)> {
+) -> Result<(PathBuf, Option<String>), String> {
     let clean_proj = project_id.trim().trim_matches('/');
     if clean_proj.is_empty() || clean_proj.contains("..") || clean_proj.contains('/') {
-        return None;
+        return Err("Sandbox violation: invalid project_id".to_string());
     }
     let root = code_root_dir();
     let work_dir = root.join(clean_proj);
     if !work_dir.is_dir() {
-        return None;
+        return Err(format!(
+            "Sandbox violation: workspace directory does not exist for '{}'",
+            clean_proj
+        ));
     }
+    let canon_work_dir = std::fs::canonicalize(&work_dir)
+        .map_err(|e| format!("Sandbox violation: failed to canonicalize workspace: {}", e))?;
 
     if let Some(raw_rel) = target_path {
-        let trimmed = raw_rel.trim().trim_start_matches('/');
-        if trimmed.is_empty() {
-            return Some((work_dir, None));
+        let clean = raw_rel.trim().trim_start_matches('/');
+        if clean.is_empty() {
+            return Ok((work_dir, None));
         }
-        if trimmed.contains("..") || trimmed.starts_with('/') {
-            return None;
+        if clean.contains("..") || clean.starts_with('/') {
+            return Err("Sandbox violation: target_path traversal rejected".to_string());
         }
-        return Some((work_dir, Some(trimmed.to_string())));
+        let candidate = work_dir.join(clean);
+        let mut probe = candidate.as_path();
+        while !probe.exists() && std::fs::symlink_metadata(probe).is_err() {
+            if let Some(parent) = probe.parent() {
+                probe = parent;
+            } else {
+                break;
+            }
+        }
+        let canon_target = std::fs::canonicalize(probe).map_err(|_| {
+            "Sandbox violation: symlink target escapes workspace boundary".to_string()
+        })?;
+        if !canon_target.starts_with(&canon_work_dir) {
+            return Err(
+                "Sandbox violation: symlink target escapes workspace boundary".to_string(),
+            );
+        }
+        return Ok((work_dir, Some(clean.to_string())));
     }
 
-    Some((work_dir, None))
+    Ok((work_dir, None))
 }
 
 /// Pure deterministic parser for `git status --porcelain=v1 -b`, `git diff --numstat`, and `git log`.
@@ -157,7 +195,7 @@ pub fn parse_git_porcelain_and_numstat(
 
 /// Read-only probe of the active workspace's Git working tree.
 pub fn probe_git_status(project_id: &str) -> GitStatusSnapshot {
-    let Some((work_dir, _)) = validate_workspace_sandbox(project_id, None) else {
+    let Ok((work_dir, _)) = validate_workspace_sandbox(project_id, None) else {
         return GitStatusSnapshot {
             branch: "unknown".to_string(),
             is_clean: true,
@@ -194,7 +232,7 @@ pub fn probe_git_status(project_id: &str) -> GitStatusSnapshot {
 
 /// Computes a bounded unified diff for the entire workspace or a single file inside the sandbox.
 pub fn compute_workspace_diff(project_id: &str, target_path: Option<&str>) -> GitDiffPayload {
-    let Some((work_dir, clean_rel)) = validate_workspace_sandbox(project_id, target_path) else {
+    let Ok((work_dir, clean_rel)) = validate_workspace_sandbox(project_id, target_path) else {
         return GitDiffPayload {
             project_id: project_id.to_string(),
             target_path: target_path.map(|s| s.to_string()),
@@ -278,28 +316,54 @@ pub fn compute_workspace_diff(project_id: &str, target_path: Option<&str>) -> Gi
     }
 }
 
-/// Auto-detects the test runner framework and default command for a directory.
-pub fn detect_test_runner_in_dir(dir: &Path) -> (String, String) {
-    if dir.join("Cargo.toml").is_file() {
-        return ("cargo".to_string(), "cargo test".to_string());
+/// Auto-detects the structured test runner specification (`program` + `args`) for a directory.
+pub fn detect_test_runner_spec_in_dir(work_dir: &Path) -> Option<TestRunnerSpec> {
+    if work_dir.join("Cargo.toml").is_file() {
+        return Some(TestRunnerSpec {
+            framework: "cargo".to_string(),
+            program: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            display_command: "cargo test".to_string(),
+        });
     }
-    if dir.join("package.json").is_file() {
-        return ("npm".to_string(), "npm test".to_string());
+    if work_dir.join("package.json").is_file() {
+        return Some(TestRunnerSpec {
+            framework: "npm".to_string(),
+            program: "npm".to_string(),
+            args: vec!["test".to_string()],
+            display_command: "npm test".to_string(),
+        });
     }
-    if dir.join("pyproject.toml").is_file() || dir.join("pytest.ini").is_file() {
-        return ("pytest".to_string(), "pytest".to_string());
+    if work_dir.join("pyproject.toml").is_file() || work_dir.join("pytest.ini").is_file() {
+        return Some(TestRunnerSpec {
+            framework: "pytest".to_string(),
+            program: "pytest".to_string(),
+            args: vec![],
+            display_command: "pytest".to_string(),
+        });
     }
-    if dir.join("go.mod").is_file() {
-        return ("go".to_string(), "go test ./...".to_string());
+    if work_dir.join("go.mod").is_file() {
+        return Some(TestRunnerSpec {
+            framework: "go".to_string(),
+            program: "go".to_string(),
+            args: vec!["test".to_string(), "./...".to_string()],
+            display_command: "go test ./...".to_string(),
+        });
     }
-    ("custom".to_string(), "cargo test".to_string())
+    None
+}
+
+/// Thin compatibility wrapper around `detect_test_runner_spec_in_dir`.
+pub fn detect_test_runner_in_dir(work_dir: &Path) -> Option<(String, String)> {
+    detect_test_runner_spec_in_dir(work_dir).map(|spec| (spec.framework, spec.display_command))
 }
 
 pub fn detect_workspace_test_runner(project_id: &str) -> (String, String) {
-    let Some((work_dir, _)) = validate_workspace_sandbox(project_id, None) else {
+    let Ok((work_dir, _)) = validate_workspace_sandbox(project_id, None) else {
         return ("cargo".to_string(), "cargo test".to_string());
     };
     detect_test_runner_in_dir(&work_dir)
+        .unwrap_or_else(|| ("custom".to_string(), "cargo test".to_string()))
 }
 
 /// Parses passed and failed test counts from deterministic test runner output (`cargo test`, `npm`, `pytest`, `go`).
@@ -353,17 +417,39 @@ pub fn parse_test_runner_counts(framework: &str, output: &str, exit_ok: bool) ->
     (passed, failed)
 }
 
-/// Non-blocking read-only probe of GitHub PR/CI status and local service health endpoints.
+/// Non-blocking read-only probe of GitHub PR/CI status and local service health endpoints,
+/// guarded by a 15-second TTL cache keyed by `format!("{}:{}:{}", work_dir.display(), branch, port)`.
 pub fn probe_deploy_and_health(
     project_id: &str,
     git: &GitStatusSnapshot,
     port: u16,
-) -> DeployHealthSnapshot {
+) -> DeployHealthSummary {
+    let work_dir_opt = validate_workspace_sandbox(project_id, None)
+        .ok()
+        .map(|(w, _)| w);
+    let branch = git.branch.as_str();
+    let cache_key = match &work_dir_opt {
+        Some(work_dir) => format!("{}:{}:{}", work_dir.display(), branch, port),
+        None => format!("{}:{}:{}", project_id, branch, port),
+    };
+
+    let cache = DEPLOY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_at, cached_snap)) = guard.get(&cache_key) {
+            if cached_at.elapsed() < Duration::from_secs(15) {
+                let mut snap = cached_snap.clone();
+                let ci_failing = snap.ci_runs.iter().any(|r| r.conclusion == "failure");
+                snap.release_ready = git.is_clean && git.behind == 0 && !ci_failing;
+                return snap;
+            }
+        }
+    }
+
     let mut ci_runs = Vec::new();
     let mut pr_summary = None;
     let mut pr_state = None;
 
-    if let Some((work_dir, _)) = validate_workspace_sandbox(project_id, None) {
+    if let Some(work_dir) = work_dir_opt {
         if work_dir.join(".git").exists() {
             if let Ok(out) = StdCommand::new("gh")
                 .args([
@@ -449,7 +535,7 @@ pub fn probe_deploy_and_health(
     let ci_failing = ci_runs.iter().any(|r| r.conclusion == "failure");
     let release_ready = git.is_clean && git.behind == 0 && !ci_failing;
 
-    DeployHealthSnapshot {
+    let snapshot = DeployHealthSnapshot {
         project_id: project_id.to_string(),
         pr_summary,
         pr_state,
@@ -457,7 +543,13 @@ pub fn probe_deploy_and_health(
         endpoints,
         release_ready,
         checked_at: now_iso_short(),
+    };
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(cache_key, (Instant::now(), snapshot.clone()));
     }
+
+    snapshot
 }
 
 /// Builds the complete `WorkspaceDevOpsSnapshot` for a workspace.
@@ -498,10 +590,17 @@ pub async fn run_workspace_tests(
     project_id: String,
     port: u16,
 ) {
-    let Some((work_dir, _)) = validate_workspace_sandbox(&project_id, None) else {
+    let Ok((work_dir, _)) = validate_workspace_sandbox(&project_id, None) else {
         return;
     };
-    let (framework, command_str) = detect_test_runner_in_dir(&work_dir);
+    let spec = detect_test_runner_spec_in_dir(&work_dir).unwrap_or_else(|| TestRunnerSpec {
+        framework: "custom".to_string(),
+        program: "cargo".to_string(),
+        args: vec!["test".to_string()],
+        display_command: "cargo test".to_string(),
+    });
+    let framework = spec.framework.clone();
+    let command_str = spec.display_command.clone();
     let task_node_id = format!("task-test-{}", project_id);
     let (abort_tx, mut abort_rx) = watch::channel(false);
 
@@ -584,12 +683,8 @@ pub async fn run_workspace_tests(
     }
 
     let started = Instant::now();
-    let parts: Vec<&str> = command_str.split_whitespace().collect();
-    let bin = parts.first().copied().unwrap_or("cargo");
-    let args = &parts[1..];
-
-    let mut cmd = TokioCommand::new(bin);
-    cmd.args(args).current_dir(&work_dir).kill_on_drop(true);
+    let mut cmd = TokioCommand::new(&spec.program);
+    cmd.args(&spec.args).current_dir(&work_dir).kill_on_drop(true);
 
     let out_res = tokio::select! {
         res = tokio::time::timeout(Duration::from_secs(60), cmd.output()) => Some(res),
@@ -740,9 +835,9 @@ test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
     #[test]
     fn anchor_test_sandbox_guard_rejects_traversal() {
-        assert!(validate_workspace_sandbox("../etc", None).is_none());
-        assert!(validate_workspace_sandbox("exo-suit", Some("../../etc/passwd")).is_none());
+        assert!(validate_workspace_sandbox("../etc", None).is_err());
+        assert!(validate_workspace_sandbox("exo-suit", Some("../../etc/passwd")).is_err());
         let valid = validate_workspace_sandbox("exo-suit", Some("src/main.rs"));
-        assert!(valid.is_some());
+        assert!(valid.is_ok());
     }
 }

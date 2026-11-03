@@ -16,11 +16,38 @@ pub fn home_dir() -> PathBuf {
 }
 
 pub fn brain_dir() -> PathBuf {
+    if let Ok(custom) = std::env::var("EXO_BRAIN_DIR") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     home_dir().join(".gemini").join("antigravity-cli").join("brain")
 }
 
 pub fn code_root_dir() -> PathBuf {
+    if let Ok(custom) = std::env::var("EXO_CODE_ROOT") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     home_dir().join("code")
+}
+
+pub fn atomic_write_string(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let tmp_path = path.with_file_name(format!("{}.tmp.{}", file_name, std::process::id()));
+    fs::write(&tmp_path, content)?;
+    fs::rename(&tmp_path, path)
 }
 
 pub fn clean_ansi_and_tags(text: &str) -> String {
@@ -150,11 +177,65 @@ pub fn classify_file_kind(file_name: &str) -> String {
     }
 }
 
+pub fn resolve_sandboxed_workspace_path(project_slug: &str, rel_path: &str) -> Option<PathBuf> {
+    if rel_path.contains('\0') {
+        return None;
+    }
+    let slug = validate_project_slug(project_slug).ok()?;
+    let trimmed = rel_path.trim().trim_start_matches("file://");
+    let rel_p = Path::new(trimmed);
+    if rel_p.is_absolute() {
+        return None;
+    }
+    for comp in rel_p.components() {
+        if matches!(
+            comp,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        ) {
+            return None;
+        }
+    }
+
+    let code_root = fs::canonicalize(code_root_dir()).ok()?;
+    let proj_root = fs::canonicalize(code_root.join(&slug)).ok()?;
+    if !proj_root.starts_with(&code_root) || !proj_root.is_dir() {
+        return None;
+    }
+
+    if trimmed.is_empty() || trimmed == "." {
+        return Some(proj_root);
+    }
+
+    let candidate = proj_root.join(rel_p);
+    if fs::symlink_metadata(&candidate).is_ok() {
+        let canon = fs::canonicalize(&candidate).ok()?;
+        if canon.starts_with(&proj_root) {
+            Some(canon)
+        } else {
+            None
+        }
+    } else {
+        let parent = candidate.parent()?;
+        let file_name = candidate.file_name()?;
+        let canon_parent = fs::canonicalize(parent).ok()?;
+        if canon_parent.starts_with(&proj_root) {
+            Some(canon_parent.join(file_name))
+        } else {
+            None
+        }
+    }
+}
+
 pub fn resolve_sandboxed_file_path(
     raw_path: &str,
     active_session_id: &str,
     active_project: &str,
 ) -> Option<PathBuf> {
+    if raw_path.contains('\0') {
+        return None;
+    }
     let trimmed = raw_path
         .trim()
         .trim_start_matches("file://")
@@ -167,12 +248,11 @@ pub fn resolve_sandboxed_file_path(
     }
 
     let code_root = fs::canonicalize(code_root_dir()).unwrap_or_else(|_| code_root_dir());
-    let gemini_root =
-        fs::canonicalize(home_dir().join(".gemini")).unwrap_or_else(|_| home_dir().join(".gemini"));
+    let brain_root = fs::canonicalize(brain_dir()).unwrap_or_else(|_| brain_dir());
 
     let is_allowed = |cand: &Path| -> Option<PathBuf> {
         let canon = fs::canonicalize(cand).ok()?;
-        if canon.is_file() && (canon.starts_with(&code_root) || canon.starts_with(&gemini_root)) {
+        if canon.is_file() && (canon.starts_with(&code_root) || canon.starts_with(&brain_root)) {
             Some(canon)
         } else {
             None
@@ -238,8 +318,7 @@ pub fn read_bounded_file(
     active_project: &str,
 ) -> Option<OpenedFile> {
     let code_root = fs::canonicalize(code_root_dir()).unwrap_or_else(|_| code_root_dir());
-    let gemini_root =
-        fs::canonicalize(home_dir().join(".gemini")).unwrap_or_else(|_| home_dir().join(".gemini"));
+    let brain_root = fs::canonicalize(brain_dir()).unwrap_or_else(|_| brain_dir());
     let safe_path = resolve_sandboxed_file_path(rel_file_path, active_session_id, active_project)?;
 
     let name = safe_path
@@ -249,8 +328,8 @@ pub fn read_bounded_file(
 
     let rel_path = if let Ok(rel) = safe_path.strip_prefix(&code_root) {
         rel.to_string_lossy().to_string()
-    } else if let Ok(rel) = safe_path.strip_prefix(&gemini_root) {
-        format!("~/.gemini/{}", rel.to_string_lossy())
+    } else if let Ok(rel) = safe_path.strip_prefix(&brain_root) {
+        format!("~/.gemini/antigravity-cli/brain/{}", rel.to_string_lossy())
     } else {
         safe_path.to_string_lossy().to_string()
     };
@@ -329,9 +408,8 @@ pub fn infer_session_project_id(session_id: &str) -> String {
     }
     let s_path = brain_dir().join(session_id);
     if let Ok(saved) = fs::read_to_string(s_path.join(".session_project.txt")) {
-        let trimmed = saved.trim();
-        if !trimmed.is_empty() && !trimmed.contains("..") {
-            return trimmed.to_string();
+        if let Ok(valid) = validate_project_slug(saved.trim()) {
+            return valid;
         }
     }
 
@@ -341,8 +419,11 @@ pub fn infer_session_project_id(session_id: &str) -> String {
         if let Ok(content) = fs::read_to_string(&tp) {
             for line in content.lines() {
                 if let Some(slug) = extract_project_slug_from_text(line) {
-                    if code_root.join(&slug).is_dir() {
-                        return slug;
+                    if let Ok(valid) = validate_project_slug(&slug) {
+                        if code_root.join(&valid).is_dir() {
+                            let _ = save_session_project_id(session_id, &valid);
+                            return valid;
+                        }
                     }
                 }
             }
@@ -356,16 +437,19 @@ pub fn save_session_project_id(session_id: &str, project_id: &str) -> bool {
     if session_id.is_empty()
         || session_id.contains("..")
         || session_id.contains('/')
-        || project_id.trim().is_empty()
-        || project_id.contains("..")
+        || session_id.contains('\\')
+        || session_id.contains('\0')
     {
         return false;
     }
+    let Ok(valid_slug) = validate_project_slug(project_id) else {
+        return false;
+    };
     let s_path = brain_dir().join(session_id);
     if !s_path.exists() {
         return false;
     }
-    fs::write(s_path.join(".session_project.txt"), project_id.trim()).is_ok()
+    atomic_write_string(&s_path.join(".session_project.txt"), &valid_slug).is_ok()
 }
 
 pub fn resolve_execution_scope(session_id: &str, requested_project: &str) -> ExecutionScope {
@@ -376,7 +460,7 @@ pub fn resolve_execution_scope(session_id: &str, requested_project: &str) -> Exe
     };
 
     let candidate_proj = if !requested_project.trim().is_empty() {
-        requested_project.trim().to_string()
+        validate_project_slug(requested_project).unwrap_or_else(|_| "exo-suit".to_string())
     } else {
         infer_session_project_id(&clean_session)
     };
@@ -410,6 +494,7 @@ pub fn resolve_execution_scope(session_id: &str, requested_project: &str) -> Exe
 
 pub fn get_past_sessions(limit: usize) -> Vec<SessionItem> {
     let bdir = brain_dir();
+    let code_root = code_root_dir();
     let mut sessions = Vec::new();
     let Ok(read_dir) = fs::read_dir(&bdir) else {
         return sessions;
@@ -456,6 +541,11 @@ pub fn get_past_sessions(limit: usize) -> Vec<SessionItem> {
         let mut step_count = 0u32;
         let mut subagent_count = 0u32;
 
+        let saved_project = fs::read_to_string(s_path.join(".session_project.txt"))
+            .ok()
+            .and_then(|s| validate_project_slug(s.trim()).ok());
+        let mut inferred_project = saved_project.clone();
+
         let transcript_p = s_path
             .join(".system_generated")
             .join("logs")
@@ -466,6 +556,15 @@ pub fn get_past_sessions(limit: usize) -> Vec<SessionItem> {
                 step_count += 1;
                 if line.contains("\"invoke_subagent\"") {
                     subagent_count += 1;
+                }
+                if inferred_project.is_none() {
+                    if let Some(slug) = extract_project_slug_from_text(line) {
+                        if let Ok(valid) = validate_project_slug(&slug) {
+                            if code_root.join(&valid).is_dir() {
+                                inferred_project = Some(valid);
+                            }
+                        }
+                    }
                 }
                 if first_prompt == "Interactive Agent Session" && line.contains("\"USER_INPUT\"") {
                     if let Ok(val) = serde_json::from_str::<Value>(line) {
@@ -482,12 +581,18 @@ pub fn get_past_sessions(limit: usize) -> Vec<SessionItem> {
             }
         }
 
+        if saved_project.is_none() {
+            if let Some(ref slug) = inferred_project {
+                let _ = save_session_project_id(&s_id, slug);
+            }
+        }
+
         let custom_title = fs::read_to_string(s_path.join(".session_title.txt"))
             .ok()
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
 
-        let project_id = infer_session_project_id(&s_id);
+        let project_id = inferred_project.unwrap_or_else(|| "exo-suit".to_string());
 
         sessions.push(SessionItem {
             session_id: s_id,
@@ -519,7 +624,7 @@ pub fn rename_session(session_id: &str, new_title: &str) -> bool {
         true
     } else {
         let bounded: String = trimmed.chars().take(80).collect();
-        fs::write(&title_file, bounded).is_ok()
+        atomic_write_string(&title_file, &bounded).is_ok()
     }
 }
 
@@ -887,7 +992,7 @@ pub fn approve_artifact_metadata(session_id: &str, artifact_name: &str) -> bool 
                 obj.insert("approved".to_string(), Value::Bool(true));
                 obj.insert("requestFeedback".to_string(), Value::Bool(false));
                 if let Ok(serialized) = serde_json::to_string_pretty(&val) {
-                    return fs::write(&meta_p, serialized).is_ok();
+                    return atomic_write_string(&meta_p, &serialized).is_ok();
                 }
             }
         }
@@ -922,9 +1027,67 @@ pub fn save_session_interactive_answer(
     map.insert(prompt_id.to_string(), answers.to_vec());
     let p = s_dir.join(".interactive_answers.json");
     if let Ok(serialized) = serde_json::to_string_pretty(&map) {
-        return fs::write(&p, serialized).is_ok();
+        return atomic_write_string(&p, &serialized).is_ok();
     }
     false
+}
+
+pub fn reconcile_interactive_prompt(
+    step_index: u32,
+    questions: Vec<InteractiveQuestionItem>,
+    subsequent_steps: &[Value],
+    saved_answers: &HashMap<String, Vec<String>>,
+) -> InteractivePrompt {
+    let prompt_id = format!("ask-step-{}", step_index);
+    let mut cli_answers = Vec::new();
+
+    for next_val in subsequent_steps.iter().take(6) {
+        let next_type = next_val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if next_type == "GENERIC" {
+            if let Some(nc) = next_val.get("content").and_then(|v| v.as_str()) {
+                let extracted = extract_generic_step_answers(nc);
+                if !extracted.is_empty() {
+                    cli_answers = extracted;
+                    break;
+                }
+            }
+        } else if next_type == "PLANNER_RESPONSE" || next_type == "USER_INPUT" {
+            break;
+        }
+    }
+
+    let final_answers = if !cli_answers.is_empty() {
+        cli_answers
+    } else if let Some(saved) = saved_answers.get(&prompt_id) {
+        saved.clone()
+    } else {
+        Vec::new()
+    };
+
+    let has_subsequent_user_input = subsequent_steps.iter().any(|v| {
+        if v.get("type").and_then(|t| t.as_str()) != Some("USER_INPUT") {
+            return false;
+        }
+        if let Some(c) = v.get("content").and_then(|c| c.as_str()) {
+            if c.contains("<SYSTEM_MESSAGE>") && !c.contains("<USER_REQUEST>") {
+                return false;
+            }
+        }
+        true
+    });
+
+    let is_answered = !final_answers.is_empty() || has_subsequent_user_input;
+    InteractivePrompt {
+        prompt_id,
+        step_index,
+        status: if is_answered {
+            "Answered".to_string()
+        } else {
+            "Pending".to_string()
+        },
+        questions,
+        answers: final_answers,
+    }
 }
 
 pub fn parse_ask_question_args(args: Option<&Value>) -> Vec<InteractiveQuestionItem> {
@@ -1085,7 +1248,6 @@ pub fn get_session_chat_thread(session_id: &str) -> Vec<ChatMessage> {
     let mut pending_step: u32 = 0;
     let mut pending_ts = String::new();
     let mut turn_anchor_step: u32 = 0;
-    let mut last_step_had_tools = false;
     let mut has_open_turn = false;
 
     for (idx, val) in steps.iter().enumerate() {
@@ -1156,7 +1318,6 @@ pub fn get_session_chat_thread(session_id: &str) -> Vec<ChatMessage> {
             turn_anchor_step = step_index + 1;
             pending_step = step_index + 1;
             pending_ts = created_at;
-            last_step_had_tools = false;
             has_open_turn = true;
         } else if step_type == "PLANNER_RESPONSE" {
             if turn_anchor_step == 0 {
@@ -1186,7 +1347,6 @@ pub fn get_session_chat_thread(session_id: &str) -> Vec<ChatMessage> {
 
             if let Some(tcs) = val.get("tool_calls").and_then(|v| v.as_array()) {
                 if !tcs.is_empty() {
-                    last_step_had_tools = true;
                     for tc in tcs {
                         let name = tc
                             .get("name")
@@ -1240,49 +1400,18 @@ pub fn get_session_chat_thread(session_id: &str) -> Vec<ChatMessage> {
                             status: "Completed".to_string(),
                         });
                     }
-                } else {
-                    last_step_had_tools = false;
                 }
-            } else {
-                last_step_had_tools = false;
             }
 
             // If this PLANNER_RESPONSE presented interactive questions via `ask_question`,
             // surface it immediately as a dedicated interactive message card in the chat thread!
             if !step_interactive_questions.is_empty() {
-                let prompt_id = format!("ask-step-{}", step_index);
-                let mut cli_answers = Vec::new();
-                let has_subsequent_steps = idx + 1 < steps.len();
-
-                for next_val in steps.iter().skip(idx + 1).take(6) {
-                    let next_type = next_val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if next_type == "GENERIC" {
-                        if let Some(nc) = next_val.get("content").and_then(|v| v.as_str()) {
-                            let extracted = extract_generic_step_answers(nc);
-                            if !extracted.is_empty() {
-                                cli_answers = extracted;
-                                break;
-                            }
-                        }
-                    } else if next_type == "PLANNER_RESPONSE" || next_type == "USER_INPUT" {
-                        break;
-                    }
-                }
-
-                let final_answers = if !cli_answers.is_empty() {
-                    cli_answers
-                } else if let Some(saved) = saved_answers.get(&prompt_id) {
-                    saved.clone()
-                } else {
-                    Vec::new()
-                };
-
-                let is_answered = !final_answers.is_empty() || has_subsequent_steps;
-                let prompt_status = if is_answered {
-                    "Answered".to_string()
-                } else {
-                    "Pending".to_string()
-                };
+                let reconciled = reconcile_interactive_prompt(
+                    step_index,
+                    step_interactive_questions,
+                    &steps[idx + 1..],
+                    &saved_answers,
+                );
 
                 if pending_tools.len() > 45 {
                     pending_tools = pending_tools.split_off(pending_tools.len() - 45);
@@ -1300,18 +1429,11 @@ pub fn get_session_chat_thread(session_id: &str) -> Vec<ChatMessage> {
                     thinking: pending_thinking.take(),
                     tool_calls: std::mem::take(&mut pending_tools),
                     streaming: false,
-                    interactive_prompt: Some(InteractivePrompt {
-                        prompt_id,
-                        step_index,
-                        status: prompt_status,
-                        questions: step_interactive_questions,
-                        answers: final_answers,
-                    }),
+                    interactive_prompt: Some(reconciled),
                 });
 
                 turn_anchor_step = step_index + 1;
                 pending_step = step_index + 1;
-                last_step_had_tools = false;
                 has_open_turn = false;
             }
         }
@@ -1326,8 +1448,8 @@ pub fn get_session_chat_thread(session_id: &str) -> Vec<ChatMessage> {
         if pending_tools.len() > 45 {
             pending_tools = pending_tools.split_off(pending_tools.len() - 45);
         }
-        // The turn is actively streaming/working if the latest step invoked tools or final content hasn't arrived yet
-        let is_streaming = last_step_had_tools || pending_content.is_empty();
+        // The turn is actively streaming/working only if final content hasn't arrived yet
+        let is_streaming = pending_content.is_empty();
         if is_streaming {
             if let Some(last_tc) = pending_tools.last_mut() {
                 last_tc.status = "Running".to_string();
@@ -1545,47 +1667,12 @@ fn parse_session_node_recursive(
                     if name == "ask_question" {
                         let parsed_qs = parse_ask_question_args(args);
                         if !parsed_qs.is_empty() {
-                            let prompt_id = format!("ask-step-{}", step_count);
-                            let mut cli_answers = Vec::new();
-                            let has_subsequent_steps = idx + 1 < total_lines;
-                            for next_val in steps.iter().skip(idx + 1).take(6) {
-                                let next_type =
-                                    next_val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                if next_type == "GENERIC" {
-                                    if let Some(nc) =
-                                        next_val.get("content").and_then(|v| v.as_str())
-                                    {
-                                        let extracted = extract_generic_step_answers(nc);
-                                        if !extracted.is_empty() {
-                                            cli_answers = extracted;
-                                            break;
-                                        }
-                                    }
-                                } else if next_type == "PLANNER_RESPONSE"
-                                    || next_type == "USER_INPUT"
-                                {
-                                    break;
-                                }
-                            }
-                            let final_answers = if !cli_answers.is_empty() {
-                                cli_answers
-                            } else if let Some(saved) = saved_answers.get(&prompt_id) {
-                                saved.clone()
-                            } else {
-                                Vec::new()
-                            };
-                            let is_answered = !final_answers.is_empty() || has_subsequent_steps;
-                            latest_interactive_prompt = Some(InteractivePrompt {
-                                prompt_id,
-                                step_index: step_count,
-                                status: if is_answered {
-                                    "Answered".to_string()
-                                } else {
-                                    "Pending".to_string()
-                                },
-                                questions: parsed_qs,
-                                answers: final_answers,
-                            });
+                            latest_interactive_prompt = Some(reconcile_interactive_prompt(
+                                step_count,
+                                parsed_qs,
+                                &steps[idx + 1..],
+                                &saved_answers,
+                            ));
                         }
                     }
 
@@ -2321,9 +2408,9 @@ pub fn provision_workspace_and_session_in_roots(
             }
         });
 
-    fs::write(session_dir.join(".session_project.txt"), &slug)
+    atomic_write_string(&session_dir.join(".session_project.txt"), &slug)
         .map_err(|e| format!("Failed to persist .session_project.txt: {}", e))?;
-    fs::write(session_dir.join(".session_title.txt"), &final_title)
+    atomic_write_string(&session_dir.join(".session_title.txt"), &final_title)
         .map_err(|e| format!("Failed to persist .session_title.txt: {}", e))?;
 
     let now_secs = std::time::SystemTime::now()
@@ -2374,6 +2461,133 @@ pub fn provision_workspace_and_session(
         raw_description,
         init_git,
     )
+}
+
+pub fn load_session_agy_conversation_id(session_id: &str) -> Option<String> {
+    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+        return None;
+    }
+    let map_file = brain_dir().join(session_id).join(".agy_conversation_id.txt");
+    if let Ok(raw) = fs::read_to_string(&map_file) {
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    None
+}
+
+pub fn save_session_agy_conversation_id(session_id: &str, agy_conv_id: &str) {
+    if session_id.is_empty()
+        || session_id.contains("..")
+        || session_id.contains('/')
+        || agy_conv_id.trim().is_empty()
+    {
+        return;
+    }
+    let s_dir = brain_dir().join(session_id);
+    if s_dir.is_dir() {
+        let _ = atomic_write_string(&s_dir.join(".agy_conversation_id.txt"), agy_conv_id.trim());
+    }
+}
+
+pub fn append_turn_to_session_transcript(
+    session_id: &str,
+    prompt: &str,
+    reply_text: &str,
+    tool_calls: &[ToolCall],
+    thinking: Option<&str>,
+    tokens: &TokenMetrics,
+) {
+    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+        return;
+    }
+    if load_session_agy_conversation_id(session_id).as_deref() == Some(session_id) {
+        return;
+    }
+    let logs_dir = brain_dir()
+        .join(session_id)
+        .join(".system_generated")
+        .join("logs");
+    if fs::create_dir_all(&logs_dir).is_err() {
+        return;
+    }
+    let transcript_path = logs_dir.join("transcript.jsonl");
+    let existing = load_transcript_values(session_id);
+    let trimmed_reply = reply_text.trim();
+    if !trimmed_reply.is_empty() {
+        if let Some(last_planner) = existing
+            .iter()
+            .rev()
+            .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("PLANNER_RESPONSE"))
+        {
+            if last_planner
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(|c| c.trim() == trimmed_reply)
+                .unwrap_or(false)
+            {
+                return;
+            }
+        }
+    }
+    let next_step = existing
+        .iter()
+        .filter_map(|v| v.get("step_index").and_then(|s| s.as_u64()))
+        .max()
+        .map(|m| m as u32 + 1)
+        .unwrap_or(1);
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1_730_000_000);
+    let ts_str = format_epoch_secs(now_secs);
+
+    let user_step = serde_json::json!({
+        "step_index": next_step,
+        "source": "USER_EXPLICIT",
+        "type": "USER_INPUT",
+        "status": "DONE",
+        "created_at": ts_str,
+        "content": format!("<USER_REQUEST>\n{}\n</USER_REQUEST>", prompt)
+    });
+
+    let serialized_tcs: Vec<Value> = tool_calls
+        .iter()
+        .map(|tc| {
+            serde_json::json!({
+                "name": tc.name,
+                "args": {
+                    "toolSummary": tc.summary
+                }
+            })
+        })
+        .collect();
+
+    let planner_step = serde_json::json!({
+        "step_index": next_step + 1,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "created_at": ts_str,
+        "thinking": thinking.unwrap_or(""),
+        "content": reply_text,
+        "input_tokens": tokens.input_tokens,
+        "cache_read_tokens": tokens.cache_read_tokens,
+        "output_tokens": tokens.output_tokens,
+        "tool_calls": serialized_tcs
+    });
+
+    use std::io::Write;
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&transcript_path)
+    {
+        let _ = writeln!(file, "{}", user_step);
+        let _ = writeln!(file, "{}", planner_step);
+    }
 }
 
 #[cfg(test)]
@@ -2461,6 +2675,48 @@ mod tests {
         assert_eq!(res2.project_id, "nova-ledger");
         assert!(!res2.created_new_project);
         assert_ne!(res.session_id, res2.session_id);
+
+        let _ = fs::remove_dir_all(&tmp_base);
+    }
+
+    #[test]
+    fn anchor_test_reconcile_interactive_prompt_and_atomic_write() {
+        let tmp_base = std::env::temp_dir().join(format!(
+            "trellis_brain_unit_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_base);
+
+        // 1. Atomic write string
+        let fpath = tmp_base.join("sub").join(".session_project.txt");
+        atomic_write_string(&fpath, "exo-suit").expect("atomic write should succeed");
+        assert_eq!(fs::read_to_string(&fpath).unwrap(), "exo-suit");
+
+        // 2. reconcile_interactive_prompt does not falsely mark Answered on non-USER_INPUT steps
+        let qs = vec![InteractiveQuestionItem {
+            index: 1,
+            question: "Pick a mode".to_string(),
+            options: vec!["Fast".to_string(), "Thorough".to_string()],
+            is_multi_select: false,
+        }];
+        let saved = HashMap::new();
+        let non_user_steps = vec![serde_json::json!({
+            "step_index": 5,
+            "type": "GENERIC",
+            "status": "DONE",
+            "content": "Command exited with code 0"
+        })];
+        let prompt_pending = reconcile_interactive_prompt(4, qs.clone(), &non_user_steps, &saved);
+        assert_eq!(prompt_pending.status, "Pending");
+
+        let user_steps = vec![serde_json::json!({
+            "step_index": 5,
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "content": "<USER_REQUEST>Use Thorough mode</USER_REQUEST>"
+        })];
+        let prompt_answered = reconcile_interactive_prompt(4, qs, &user_steps, &saved);
+        assert_eq!(prompt_answered.status, "Answered");
 
         let _ = fs::remove_dir_all(&tmp_base);
     }

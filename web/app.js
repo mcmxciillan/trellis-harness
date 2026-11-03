@@ -14,6 +14,7 @@
   const state = {
     connected: false,
     ws: null,
+    pendingOutboundQueue: [],
     activeProject: "exo-suit",
     activeSessionId: "",
     executionMode: "independent", // "independent" | "council"
@@ -190,6 +191,9 @@
         connBadge.title = `ONLINE • ${location.host} • Scaffold: ${state.activeProject} • ${state.agents.length} agents`;
         connBadge.classList.remove("disconnected");
       }
+      while (state.pendingOutboundQueue.length > 0 && ws.readyState === WebSocket.OPEN) {
+        ws.send(state.pendingOutboundQueue.shift());
+      }
     });
 
     ws.addEventListener("close", () => {
@@ -214,6 +218,14 @@
   function sendCommand(payload) {
     if (state.ws && state.ws.readyState === WebSocket.OPEN) {
       state.ws.send(JSON.stringify(payload));
+    } else {
+      if (state.pendingOutboundQueue.length >= 32) {
+        state.pendingOutboundQueue.shift();
+      }
+      state.pendingOutboundQueue.push(JSON.stringify(payload));
+      if (!state.ws || state.ws.readyState === WebSocket.CLOSED) {
+        connectWebSocket();
+      }
     }
   }
 
@@ -291,6 +303,34 @@
   }
 
   function handleTelemetryPacket(pkt) {
+    if (pkt.type === "COMMAND_ERROR") {
+      console.warn(
+        `[Trellis] Command error (${pkt.command || "UNKNOWN"}):`,
+        pkt.error || "Unknown error"
+      );
+      if (pkt.command === "OPEN_FILE") {
+        state.openedFile = {
+          name: "Unable to Open File",
+          rel_path: pkt.path || "",
+          abs_path: pkt.path || "",
+          file_kind: "markdown",
+          size_bytes: 0,
+          content: `> [!WARNING] ${pkt.error || "Requested file could not be opened."}`,
+        };
+        if (state.fileViewerMainOpen) {
+          renderMainFileViewer();
+        }
+      }
+      return;
+    }
+
+    if (pkt.type === "CHAT_STREAM_UPDATE" || pkt.type === "AGENT_SPAWNED") {
+      const pktSess = pkt.session_id || pkt.active_session_id;
+      if (pktSess && state.activeSessionId && pktSess !== state.activeSessionId) {
+        return;
+      }
+    }
+
     if (pkt.project_id) {
       state.activeProject = pkt.project_id;
       syncActiveProjectUI();
@@ -413,6 +453,7 @@
       }
       const isStreaming =
         pkt.type === "CHAT_STREAM_UPDATE" ||
+        pkt.type === "AGENT_SPAWNED" ||
         state.chatThread.some((m) => m.streaming);
       renderChatTab(state.chatThread.length > prevLen || isStreaming);
       renderInteractiveQuestionBanner();
@@ -1001,17 +1042,36 @@
     if (chatBtn) {
       chatBtn.textContent = `💬 CHAT (${state.chatThread.length})`;
     }
+    if (state.devopsMainOpen) {
+      setDevOpsMainOpen(false);
+    }
+    if (state.fileViewerMainOpen) {
+      setFileViewerMainOpen(false);
+    }
+    if (state.skillsToolsMainOpen) {
+      setSkillsToolsMainOpen(false);
+    }
     switchTab("chat");
     renderChatTab(true);
     syncStopButtonState();
+    requestDraw();
   }
 
-  promptForm.addEventListener("submit", (e) => {
-    e.preventDefault();
-    const text = promptInput.value.trim();
+  function dispatchUserPrompt({ promptText, isCouncil = false, provider = null, model = null }) {
+    const text = String(promptText || "").trim();
     if (!text) return;
 
-    const isCouncil = state.executionMode === "council";
+    if (provider && !isCouncil) {
+      state.selectedProvider = provider;
+      if (providerSelect) providerSelect.value = provider;
+      updateModelDropdown();
+    }
+    if (model && !isCouncil) {
+      state.selectedModel = model;
+      if (modelSelect) modelSelect.value = model;
+    }
+
+    setExecutionMode(isCouncil ? "council" : "independent");
     pushOptimisticChatTurn(text, isCouncil);
 
     if (isCouncil) {
@@ -1032,36 +1092,22 @@
         project_id: state.activeProject,
       });
     }
+  }
+
+  promptForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const text = promptInput.value.trim();
+    if (!text) return;
+
+    dispatchUserPrompt({
+      promptText: text,
+      isCouncil: state.executionMode === "council",
+    });
+
     promptInput.value = "";
     if (growablePromptWrap) {
       growablePromptWrap.dataset.replicatedValue = "";
     }
-  });
-
-  document.getElementById("quick-jev-btn")?.addEventListener("click", () => {
-    setExecutionMode("independent");
-    state.selectedProvider = "jev";
-    providerSelect.value = "jev";
-    updateModelDropdown();
-    sendCommand({
-      command: "SUBMIT_PROMPT",
-      provider: "jev",
-      model: "jev-latest",
-      prompt: `Evaluate System-1 decision primitives (Noul risk, Choice route, Score rubric) for ${state.activeProject}`,
-      session_id: state.activeSessionId,
-      project_id: state.activeProject,
-    });
-  });
-
-  document.getElementById("quick-council-btn")?.addEventListener("click", () => {
-    setExecutionMode("council");
-    sendCommand({
-      command: "START_COUNCIL",
-      prompt: `Design the highest-throughput zero-copy architecture and mobile companion workflow for ${state.activeProject}`,
-      providers: Array.from(state.councilParticipants),
-      session_id: state.activeSessionId,
-      project_id: state.activeProject,
-    });
   });
 
   document.getElementById("reset-view-btn")?.addEventListener("click", () => {
@@ -1115,7 +1161,18 @@
   }
 
   function escapeAttr(str) {
-    return escapeHtml(str).replace(/"/g, "&quot;");
+    return escapeHtml(str).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  function sanitizeHrefUrl(rawUrl) {
+    const clean = String(rawUrl || "").trim();
+    if (
+      !clean ||
+      /^(javascript|vbscript|data):/i.test(clean.replace(/[\u0000-\u001F\s]+/g, ""))
+    ) {
+      return "#blocked-unsafe-url";
+    }
+    return clean;
   }
 
   function isLikelyOpenableFileToken(str) {
@@ -1145,7 +1202,7 @@
 
     // 0. Markdown Images: ![alt](url)
     text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, rawAlt, rawUrl) => {
-      const url = rawUrl.trim();
+      const url = sanitizeHrefUrl(rawUrl);
       let imgSrc = url;
       if (url.startsWith("file:///")) {
         imgSrc = `/raw-file?path=${encodeURIComponent(url.replace(/^file:\/\//, ""))}`;
@@ -1169,7 +1226,12 @@
           ? `<code class="md-inline-code">${escapeHtml(rawLabel.slice(1, -1))}</code>`
           : escapeHtml(rawLabel);
 
-      const url = rawUrl.trim();
+      const url = sanitizeHrefUrl(rawUrl);
+      if (url === "#blocked-unsafe-url") {
+        return stash(
+          `<a href="#blocked-unsafe-url" class="md-link" rel="noopener noreferrer">${labelHtml}</a>`
+        );
+      }
       if (url.startsWith("file://") || isLikelyOpenableFileToken(url)) {
         const withoutScheme = url.replace(/^file:\/\//, "");
         const [cleanPath, frag] = withoutScheme.split("#");
@@ -1496,7 +1558,7 @@
         ${items
           .map(
             (p) => `
-            <div class="file-row" style="border-left:3px solid ${p.color};padding:7px 9px;cursor:pointer;" data-rail-provider="${escapeHtml(p.id)}">
+            <div class="file-row" style="border-left:3px solid ${escapeAttr(p.color)};padding:7px 9px;cursor:pointer;" data-rail-provider="${escapeAttr(p.id)}">
               <div>
                 <div style="font-size:12px;font-weight:700;color:var(--text-main);">${p.icon} ${escapeHtml(p.name)}</div>
                 <div style="font-size:10.5px;color:var(--text-muted);">${escapeHtml(p.default_model)}</div>
@@ -1585,10 +1647,11 @@
     atelierLeftRail.querySelectorAll("[data-rail-provider]").forEach((el) => {
       el.addEventListener("click", () => {
         const pid = el.dataset.railProvider;
-        sendCommand({
-          command: "SUBMIT_PROMPT",
+        if (!pid) return;
+        dispatchUserPrompt({
+          promptText: `Execute ${pid} check on ${state.activeProject}`,
+          isCouncil: false,
           provider: pid,
-          prompt: `Execute ${pid} check on ${state.activeProject}`,
         });
       });
     });
@@ -1728,7 +1791,7 @@
           <button
             type="button"
             class="source-filter-pill ${src === srcFilter ? "active" : ""}"
-            data-src-pill="${escapeHtml(src)}"
+            data-src-pill="${escapeAttr(src)}"
           >
             ${src === "all" ? "All Sources" : escapeHtml(src)}
           </button>`
@@ -1767,9 +1830,9 @@
             </div>
           </details>
           <div style="display:flex;justify-content:flex-end;">
-            <button type="button" class="mini-btn primary" data-inject-prompt="Use skill ${escapeHtml(
+            <button type="button" class="mini-btn primary" data-inject-prompt="Use skill ${escapeAttr(
               s.name
-            )} (${escapeHtml(s.path)}): ">
+            )} (${escapeAttr(s.path)}): ">
               + Use Skill in Prompt
             </button>
           </div>
@@ -1804,9 +1867,9 @@
             )}</pre>
           </details>
           <div style="display:flex;justify-content:flex-end;">
-            <button type="button" class="mini-btn" data-inject-prompt="Run tool ${escapeHtml(
+            <button type="button" class="mini-btn" data-inject-prompt="Run tool ${escapeAttr(
               t.name
-            )} (${escapeHtml(t.server)}): ">
+            )} (${escapeAttr(t.server)}): ">
               + Use Tool in Prompt
             </button>
           </div>
@@ -1911,7 +1974,7 @@
           metaLabel
         )}</span>
       </span>
-      <span class="chat-trace-counts" title="${escapeHtml(countsLabel)}">${escapeHtml(
+      <span class="chat-trace-counts" title="${escapeAttr(countsLabel)}">${escapeHtml(
       countsLabel
     )}</span>
     `;
@@ -1922,7 +1985,7 @@
             .map((tc, idx) => {
               const isRun = tc.status === "Running" && msg.streaming;
               return `
-                <div class="trace-step-row" title="${escapeHtml(tc.summary || "")}">
+                <div class="trace-step-row" title="${escapeAttr(tc.summary || "")}">
                   <span class="trace-step-idx">#${idx + 1}</span>
                   <span class="trace-step-name ${isRun ? "running" : ""}">${escapeHtml(
                 tc.name
@@ -2337,9 +2400,9 @@
           let detailsEl = traceSlot.querySelector("details.chat-trace-drawer");
           if (!detailsEl) {
             traceSlot.innerHTML = `
-              <details class="chat-trace-drawer" data-trace-id="${escapeHtml(
+              <details class="chat-trace-drawer" data-trace-id="${escapeAttr(
                 msgId
-              )}" data-trace-sig="${escapeHtml(traceParts.sig)}">
+              )}" data-trace-sig="${escapeAttr(traceParts.sig)}">
                 <summary class="chat-trace-summary">${traceParts.summaryHtml}</summary>
                 <div class="chat-trace-body">
                   <div class="chat-trace-steps-slot">${traceParts.stepsHtml}</div>
@@ -2378,10 +2441,10 @@
             taskSlot.innerHTML = `
               <div class="chat-active-task-live" role="status" aria-live="polite">
                 <span class="streaming-dots" aria-hidden="true"><span></span><span></span><span></span></span>
-                <div class="active-task-content" data-task-key="${escapeHtml(task.key)}">
+                <div class="active-task-content" data-task-key="${escapeAttr(task.key)}">
                   <span class="active-task-verb">${escapeHtml(task.verb)}</span>
                   <code class="active-task-tool-code">${escapeHtml(task.toolName)}</code>
-                  <span class="active-task-target" title="${escapeHtml(task.target)}">${escapeHtml(
+                  <span class="active-task-target" title="${escapeAttr(task.target)}">${escapeHtml(
               task.target
             )}</span>
                 </div>
@@ -2403,7 +2466,7 @@
               nextContent.innerHTML = `
                 <span class="active-task-verb">${escapeHtml(task.verb)}</span>
                 <code class="active-task-tool-code">${escapeHtml(task.toolName)}</code>
-                <span class="active-task-target" title="${escapeHtml(task.target)}">${escapeHtml(
+                <span class="active-task-target" title="${escapeAttr(task.target)}">${escapeHtml(
                 task.target
               )}</span>
               `;
@@ -2647,7 +2710,12 @@
       `;
       document
         .getElementById("start-demo-council-drawer")
-        ?.addEventListener("click", () => document.getElementById("quick-council-btn").click());
+        ?.addEventListener("click", () => {
+          dispatchUserPrompt({
+            promptText: `Design the highest-throughput zero-copy architecture and mobile companion workflow for ${state.activeProject}`,
+            isCouncil: true,
+          });
+        });
       return;
     }
 
@@ -2997,10 +3065,10 @@
               <div class="file-actions">
                 ${
                   entry.is_project
-                    ? `<button class="mini-btn primary" data-set-proj="${escapeHtml(entry.rel_path)}">Set Project</button>`
+                    ? `<button class="mini-btn primary" data-set-proj="${escapeAttr(entry.rel_path)}">Set Project</button>`
                     : ""
                 }
-                <button class="mini-btn" data-browse="${escapeHtml(entry.rel_path)}">Open ➔</button>
+                <button class="mini-btn" data-browse="${escapeAttr(entry.rel_path)}">Open ➔</button>
               </div>
             </div>`;
         } else {
@@ -3105,7 +3173,7 @@
           <div style="font-size:12px;color:var(--text-muted);">${escapeHtml(art.summary)}</div>
           ${
             art.request_feedback && !art.approved
-              ? `<button class="action-btn emerald" data-approve-art="${escapeHtml(
+              ? `<button class="action-btn emerald" data-approve-art="${escapeAttr(
                   art.name
                 )}">✅ APPROVE ARTIFACT</button>`
               : ""
@@ -3138,7 +3206,7 @@
     pane.innerHTML = state.providers
       .map(
         (p) => `
-        <div class="card" style="border-left: 3.5px solid ${p.color};">
+        <div class="card" style="border-left: 3.5px solid ${escapeAttr(p.color)};">
           <div class="card-header">
             <span class="card-title">${p.icon} ${escapeHtml(p.name)}</span>
             <span class="badge ${p.model_class === "DECISION_SYSTEM_1" ? "completed" : p.mode.startsWith("LIVE") ? "completed" : "awaiting"}">
@@ -3151,7 +3219,7 @@
             Runtime Mode: <code>${escapeHtml(p.cli_path || p.mode)}</code>
           </div>
           <div style="display:flex;gap:6px;">
-            <button class="mini-btn primary" data-run-provider="${escapeHtml(p.id)}">
+            <button class="mini-btn primary" data-run-provider="${escapeAttr(p.id)}">
               ${p.model_class === "DECISION_SYSTEM_1" ? "🎯 Evaluate System-1 Gate" : "⚡ Run Provider"}
             </button>
           </div>
@@ -3162,11 +3230,12 @@
     pane.querySelectorAll("[data-run-provider]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const pid = btn.dataset.runProvider;
+        if (!pid) return;
         keysDialog?.close();
-        sendCommand({
-          command: "SUBMIT_PROMPT",
+        dispatchUserPrompt({
+          promptText: `Perform rapid architectural & health check on ${state.activeProject}`,
+          isCouncil: false,
           provider: pid,
-          prompt: `Perform rapid architectural & health check on ${state.activeProject}`,
         });
       });
     });
@@ -3187,10 +3256,6 @@
   }
 
   window.addEventListener("resize", resizeCanvas);
-  if (typeof ResizeObserver !== "undefined" && graphViewport) {
-    const ro = new ResizeObserver(() => resizeCanvas());
-    ro.observe(graphViewport);
-  }
 
   function screenToWorld(sx, sy) {
     return {
@@ -3883,15 +3948,23 @@
 
   function triggerLifecycleWorkflow(promptText, autoSubmit = false) {
     if (!promptInput) return;
+    document.getElementById("slash-cmd-popover")?.classList.add("hidden");
+    if (autoSubmit) {
+      promptInput.value = "";
+      if (growablePromptWrap) {
+        growablePromptWrap.dataset.replicatedValue = "";
+      }
+      dispatchUserPrompt({
+        promptText,
+        isCouncil: state.executionMode === "council",
+      });
+      return;
+    }
     promptInput.value = promptText;
     if (growablePromptWrap) {
       growablePromptWrap.dataset.replicatedValue = promptText;
     }
-    document.getElementById("slash-cmd-popover")?.classList.add("hidden");
     promptInput.focus();
-    if (autoSubmit) {
-      promptForm.requestSubmit();
-    }
   }
 
   document.querySelectorAll("#lifecycle-pipeline-dock [data-slash-cmd]").forEach((btn) => {

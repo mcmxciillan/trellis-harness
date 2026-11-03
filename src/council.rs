@@ -1,19 +1,49 @@
 use crate::brain::{
-    build_live_session_graph, format_epoch_secs, get_session_chat_thread, resolve_execution_scope,
+    append_turn_to_session_transcript, build_live_session_graph, format_epoch_secs,
+    get_past_sessions, get_session_chat_thread, infer_session_project_id,
+    load_session_agy_conversation_id, resolve_execution_scope, save_session_agy_conversation_id,
     save_session_interactive_answer, save_session_project_id,
 };
+use crate::devops::build_workspace_devops_snapshot;
 use crate::models::{
     AgentNode, ChatMessage, CouncilProposal, CouncilScoreEntry, CouncilSession, InteractivePrompt,
     RankedChoiceVote, TokenMetrics, ToolCall,
 };
 use crate::providers::{
-    build_provider_registry, evaluate_jev_decision_gate, execute_provider_prompt,
+    build_provider_registry, detect_binary, evaluate_jev_decision_gate, execute_provider_prompt,
+    run_agy_streaming_turn, AgyParsedEvent, AgyStreamOutcome,
 };
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, watch, RwLock};
+
+static ACTIVE_SERVER_PORT: AtomicU16 = AtomicU16::new(9000);
+static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+pub fn active_server_port() -> u16 {
+    let port = ACTIVE_SERVER_PORT.load(Ordering::Relaxed);
+    if port == 0 {
+        9000
+    } else {
+        port
+    }
+}
+
+pub fn set_active_server_port(port: u16) {
+    ACTIVE_SERVER_PORT.store(if port == 0 { 9000 } else { port }, Ordering::Relaxed);
+}
+
+pub fn next_monotonic_run_id(prefix: &str) -> String {
+    let seq = RUN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() % 100_000)
+        .unwrap_or(1);
+    format!("{}-{}-{}", prefix, ts, seq)
+}
 
 #[derive(Clone, Debug)]
 pub struct ActiveRunHandle {
@@ -39,6 +69,88 @@ pub struct SharedAppState {
 }
 
 impl SharedAppState {
+    pub fn bootstrap_from_disk(server_port: u16) -> Self {
+        set_active_server_port(server_port);
+        let sessions = get_past_sessions(25);
+        let active_session_id = sessions
+            .first()
+            .map(|s| s.session_id.clone())
+            .unwrap_or_else(|| "eae8f37c-4de6-4200-b86b-66ca0bb8edc7".to_string());
+
+        let active_project = infer_session_project_id(&active_session_id);
+        let initial_agents = build_live_session_graph(&active_session_id, &active_project);
+        let initial_chat = get_session_chat_thread(&active_session_id);
+
+        Self {
+            active_project,
+            active_session_id,
+            agents: initial_agents,
+            council: None,
+            chat_thread: initial_chat,
+            custom_chat_messages: Vec::new(),
+            session_custom_messages: HashMap::new(),
+            active_runs: HashMap::new(),
+            devops_tests: HashMap::new(),
+            api_keys: HashMap::new(),
+        }
+    }
+
+    pub fn server_port(&self) -> u16 {
+        active_server_port()
+    }
+
+    pub fn update_scoped_chat_message<F>(&mut self, session_id: &str, msg_id: &str, mut f: F) -> bool
+    where
+        F: FnMut(&mut ChatMessage),
+    {
+        let mut updated = false;
+        if let Some(msgs) = self.session_custom_messages.get_mut(session_id) {
+            if let Some(m) = msgs.iter_mut().find(|m| m.id == msg_id) {
+                f(m);
+                updated = true;
+            }
+        }
+
+        if self.active_session_id == session_id {
+            if let Some(m) = self.custom_chat_messages.iter_mut().find(|m| m.id == msg_id) {
+                f(m);
+                updated = true;
+            }
+            if let Some(m) = self.chat_thread.iter_mut().find(|m| m.id == msg_id) {
+                f(m);
+                updated = true;
+            }
+        }
+        updated
+    }
+
+    pub fn switch_active_session(
+        &mut self,
+        session_id: &str,
+    ) -> (String, Vec<AgentNode>, Vec<ChatMessage>) {
+        let inferred_proj = infer_session_project_id(session_id);
+        self.active_session_id = session_id.to_string();
+        self.active_project = inferred_proj.clone();
+        self.council = None;
+        let merged_chat = self.load_merged_session_chat(session_id);
+        self.agents = build_live_session_graph(session_id, &inferred_proj);
+        (inferred_proj, self.agents.clone(), merged_chat)
+    }
+
+    pub fn switch_active_project(&mut self, project_id: &str) -> Vec<AgentNode> {
+        let proj = project_id
+            .trim_matches('/')
+            .split('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("exo-suit")
+            .to_string();
+        self.active_project = proj.clone();
+        save_session_project_id(&self.active_session_id, &proj);
+        self.agents = build_live_session_graph(&self.active_session_id, &proj);
+        self.agents.clone()
+    }
+
     pub fn push_or_update_scoped_chat(&mut self, session_id: &str, msg: ChatMessage) {
         let entry = self
             .session_custom_messages
@@ -72,8 +184,16 @@ impl SharedAppState {
             .cloned()
             .unwrap_or_default();
         for cm in &custom {
-            if let Some(existing) = base.iter_mut().find(|m| m.id == cm.id) {
+            if let Some(existing) = base.iter_mut().find(|m| {
+                m.id == cm.id
+                    || (!cm.streaming
+                        && !cm.content.trim().is_empty()
+                        && m.role == cm.role
+                        && m.content.trim() == cm.content.trim())
+            }) {
+                let keep_id = cm.id.clone();
                 *existing = cm.clone();
+                existing.id = keep_id;
             } else {
                 base.push(cm.clone());
             }
@@ -123,43 +243,21 @@ impl SharedAppState {
                     }
                 }
 
-                if let Some(msgs) = self.session_custom_messages.get_mut(&handle.session_id) {
-                    if let Some(m) = msgs.iter_mut().find(|m| m.id == handle.reply_msg_id) {
-                        m.streaming = false;
-                        for tc in &mut m.tool_calls {
-                            if tc.status == "Running" {
-                                tc.status = "Cancelled".to_string();
-                            }
-                        }
-                        if m.content.trim().is_empty() {
-                            m.content =
-                                "*(⏹ Execution stopped by user before output was generated.)*"
-                                    .to_string();
-                        } else if !m.content.contains("Stopped by user") {
-                            m.content.push_str("\n\n*(⏹ Stopped by user)*");
+                self.update_scoped_chat_message(&handle.session_id, &handle.reply_msg_id, |m| {
+                    m.streaming = false;
+                    for tc in &mut m.tool_calls {
+                        if tc.status == "Running" {
+                            tc.status = "Cancelled".to_string();
                         }
                     }
-                }
-
-                if self.active_session_id == handle.session_id {
-                    for list in [&mut self.custom_chat_messages, &mut self.chat_thread] {
-                        if let Some(m) = list.iter_mut().find(|m| m.id == handle.reply_msg_id) {
-                            m.streaming = false;
-                            for tc in &mut m.tool_calls {
-                                if tc.status == "Running" {
-                                    tc.status = "Cancelled".to_string();
-                                }
-                            }
-                            if m.content.trim().is_empty() {
-                                m.content =
-                                    "*(⏹ Execution stopped by user before output was generated.)*"
-                                        .to_string();
-                            } else if !m.content.contains("Stopped by user") {
-                                m.content.push_str("\n\n*(⏹ Stopped by user)*");
-                            }
-                        }
+                    if m.content.trim().is_empty() {
+                        m.content =
+                            "*(⏹ Execution stopped by user before output was generated.)*"
+                                .to_string();
+                    } else if !m.content.contains("Stopped by user") {
+                        m.content.push_str("\n\n*(⏹ Stopped by user)*");
                     }
-                }
+                });
 
                 cancelled_ids.push(handle.run_id);
             }
@@ -203,45 +301,26 @@ async fn stream_text_into_chat_message(
             if *abort_rx.borrow() {
                 return;
             }
-            if let Some(msgs) = st.session_custom_messages.get_mut(session_id) {
-                if let Some(m) = msgs.iter_mut().find(|m| m.id == msg_id) {
-                    m.content = partial.clone();
-                    m.streaming = !is_done;
-                    if is_done {
-                        if final_thinking.is_some() {
-                            m.thinking = final_thinking.clone();
-                        }
-                        if !final_tools.is_empty() {
-                            m.tool_calls = final_tools.clone();
-                        }
-                        if final_interactive.is_some() {
-                            m.interactive_prompt = final_interactive.clone();
-                        }
+            st.update_scoped_chat_message(session_id, msg_id, |m| {
+                m.content = partial.clone();
+                m.streaming = !is_done;
+                if is_done {
+                    if final_thinking.is_some() {
+                        m.thinking = final_thinking.clone();
+                    }
+                    if !final_tools.is_empty() {
+                        m.tool_calls = final_tools.clone();
+                    }
+                    if final_interactive.is_some() {
+                        m.interactive_prompt = final_interactive.clone();
                     }
                 }
-            }
+            });
             if st.active_session_id == session_id {
-                let st_ref: &mut SharedAppState = &mut *st;
-                for list in [&mut st_ref.custom_chat_messages, &mut st_ref.chat_thread] {
-                    if let Some(m) = list.iter_mut().find(|m| m.id == msg_id) {
-                        m.content = partial.clone();
-                        m.streaming = !is_done;
-                        if is_done {
-                            if final_thinking.is_some() {
-                                m.thinking = final_thinking.clone();
-                            }
-                            if !final_tools.is_empty() {
-                                m.tool_calls = final_tools.clone();
-                            }
-                            if final_interactive.is_some() {
-                                m.interactive_prompt = final_interactive.clone();
-                            }
-                        }
-                    }
-                }
                 let _ = tx.send(
                     json!({
                         "type": "CHAT_STREAM_UPDATE",
+                        "session_id": session_id,
                         "active_session_id": session_id,
                         "chat_thread": st.chat_thread
                     })
@@ -328,14 +407,7 @@ pub async fn run_independent_prompt(
 
         let idx = st.agents.len() as f32;
         let offset_x = ((idx % 4.0) - 1.5) * 230.0;
-        let node_id = format!(
-            "{}-{}",
-            provider_id,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() % 10000)
-                .unwrap_or(1)
-        );
+        let node_id = next_monotonic_run_id(&provider_id);
 
         let is_decision = p_info.model_class == "DECISION_SYSTEM_1";
         let role_label = if is_decision {
@@ -439,6 +511,13 @@ pub async fn run_independent_prompt(
         };
 
         if resolved_scope.session_id == st.active_session_id {
+            if let Some(root) = st.agents.first_mut() {
+                root.status = "Running".to_string();
+                root.recent_log = format!(
+                    "Executing: {}...",
+                    prompt.chars().take(48).collect::<String>()
+                );
+            }
             st.agents.push(new_node.clone());
             st.agents.push(task_node);
         }
@@ -504,6 +583,7 @@ pub async fn run_independent_prompt(
                 "agents": st.agents,
                 "chat_thread": st.chat_thread,
                 "session_id": resolved_scope.session_id,
+                "active_session_id": resolved_scope.session_id,
                 "project_id": resolved_scope.project_id
             })
             .to_string(),
@@ -518,6 +598,423 @@ pub async fn run_independent_prompt(
 
     let (node_id, model, p_info) = provider_info;
     let reply_id = format!("reply-{}", node_id);
+    let task_node_id = format!("task-{}", node_id);
+
+    let use_live_agy = p_info.model_class != "DECISION_SYSTEM_1"
+        && (provider_id == "antigravity"
+            || (provider_id == "claude" && !p_info.has_api_key)
+            || (provider_id == "codex" && !p_info.has_api_key));
+
+    if use_live_agy {
+        if let Some(agy_bin) = detect_binary(&["agy"]) {
+            let existing_conv_id = load_session_agy_conversation_id(&scope.session_id);
+            let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<AgyParsedEvent>();
+
+            let state_for_evts = state.clone();
+            let tx_for_evts = tx.clone();
+            let scope_for_evts = scope.clone();
+            let node_id_for_evts = node_id.clone();
+            let task_node_id_for_evts = task_node_id.clone();
+            let reply_id_for_evts = reply_id.clone();
+            let prompt_len = prompt.len();
+
+            let event_consumer = async move {
+                let mut saw_real_tool = false;
+                let mut step_counter = 1u32;
+                let mut streamed_text = String::new();
+                let mut live_tokens = TokenMetrics {
+                    input_tokens: (prompt_len as u64 / 3) + 320,
+                    cache_read_tokens: 900,
+                    output_tokens: 0,
+                };
+
+                while let Some(evt) = evt_rx.recv().await {
+                    match evt {
+                        AgyParsedEvent::Init { conversation_id } => {
+                            save_session_agy_conversation_id(
+                                &scope_for_evts.session_id,
+                                &conversation_id,
+                            );
+                        }
+                        AgyParsedEvent::ToolActive {
+                            tool_name, summary, ..
+                        } => {
+                            step_counter += 1;
+                            let tool_entry = ToolCall {
+                                name: tool_name.clone(),
+                                summary: summary.clone(),
+                                status: "Running".to_string(),
+                            };
+                            let mut st = state_for_evts.write().await;
+                            if scope_for_evts.session_id == st.active_session_id {
+                                if let Some(root) = st.agents.first_mut() {
+                                    root.status = "Running".to_string();
+                                    root.recent_log = format!("{} → {}", tool_name, summary);
+                                }
+                                if let Some(tn) = st
+                                    .agents
+                                    .iter_mut()
+                                    .find(|a| a.agent_id == task_node_id_for_evts)
+                                {
+                                    tn.model = format!("TASK • {}", tool_name);
+                                    tn.role = summary.chars().take(36).collect();
+                                    tn.recent_log = format!("{} → {}", tool_name, summary);
+                                    tn.execution_step = step_counter;
+                                }
+                                if let Some(agent) = st
+                                    .agents
+                                    .iter_mut()
+                                    .find(|a| a.agent_id == node_id_for_evts)
+                                {
+                                    if !saw_real_tool {
+                                        agent.tool_calls.clear();
+                                    } else {
+                                        for tc in &mut agent.tool_calls {
+                                            if tc.status == "Running" {
+                                                tc.status = "Completed".to_string();
+                                            }
+                                        }
+                                    }
+                                    agent.tool_calls.push(tool_entry.clone());
+                                    agent.execution_step = step_counter;
+                                    agent.recent_log = format!("{} → {}", tool_name, summary);
+                                }
+                            }
+                            st.update_scoped_chat_message(
+                                &scope_for_evts.session_id,
+                                &reply_id_for_evts,
+                                |m| {
+                                    if !saw_real_tool {
+                                        m.tool_calls.clear();
+                                    } else {
+                                        for tc in &mut m.tool_calls {
+                                            if tc.status == "Running" {
+                                                tc.status = "Completed".to_string();
+                                            }
+                                        }
+                                    }
+                                    m.tool_calls.push(tool_entry.clone());
+                                },
+                            );
+                            if scope_for_evts.session_id == st.active_session_id {
+                                let _ = tx_for_evts.send(
+                                    json!({
+                                        "type": "CHAT_STREAM_UPDATE",
+                                        "session_id": scope_for_evts.session_id,
+                                        "active_session_id": scope_for_evts.session_id,
+                                        "agents": st.agents,
+                                        "chat_thread": st.chat_thread
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                            saw_real_tool = true;
+                        }
+                        AgyParsedEvent::ToolDone { tool_name, .. } => {
+                            let mut st = state_for_evts.write().await;
+                            if scope_for_evts.session_id == st.active_session_id {
+                                if let Some(agent) = st
+                                    .agents
+                                    .iter_mut()
+                                    .find(|a| a.agent_id == node_id_for_evts)
+                                {
+                                    if let Some(tc) = agent
+                                        .tool_calls
+                                        .iter_mut()
+                                        .rev()
+                                        .find(|t| t.name == tool_name && t.status == "Running")
+                                    {
+                                        tc.status = "Completed".to_string();
+                                    }
+                                }
+                            }
+                            st.update_scoped_chat_message(
+                                &scope_for_evts.session_id,
+                                &reply_id_for_evts,
+                                |m| {
+                                    if let Some(tc) = m
+                                        .tool_calls
+                                        .iter_mut()
+                                        .rev()
+                                        .find(|t| t.name == tool_name && t.status == "Running")
+                                    {
+                                        tc.status = "Completed".to_string();
+                                    }
+                                },
+                            );
+                            if scope_for_evts.session_id == st.active_session_id {
+                                let _ = tx_for_evts.send(
+                                    json!({
+                                        "type": "CHAT_STREAM_UPDATE",
+                                        "session_id": scope_for_evts.session_id,
+                                        "active_session_id": scope_for_evts.session_id,
+                                        "agents": st.agents,
+                                        "chat_thread": st.chat_thread
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                        }
+                        AgyParsedEvent::TextDelta {
+                            delta,
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens,
+                            ..
+                        } => {
+                            streamed_text.push_str(&delta);
+                            if let Some(it) = input_tokens {
+                                if it > 0 {
+                                    live_tokens.input_tokens = it;
+                                }
+                            }
+                            if let Some(ot) = output_tokens {
+                                if ot > 0 {
+                                    live_tokens.output_tokens = ot;
+                                }
+                            }
+                            if let Some(crt) = cache_read_tokens {
+                                if crt > 0 {
+                                    live_tokens.cache_read_tokens = crt;
+                                }
+                            }
+                            let preview_line: String = streamed_text
+                                .lines()
+                                .rev()
+                                .find(|l| !l.trim().is_empty())
+                                .unwrap_or("Streaming response...")
+                                .chars()
+                                .take(72)
+                                .collect();
+
+                            let mut st = state_for_evts.write().await;
+                            if scope_for_evts.session_id == st.active_session_id {
+                                if let Some(root) = st.agents.first_mut() {
+                                    root.recent_log = preview_line.clone();
+                                    root.tokens = live_tokens.clone();
+                                }
+                                if let Some(agent) = st
+                                    .agents
+                                    .iter_mut()
+                                    .find(|a| a.agent_id == node_id_for_evts)
+                                {
+                                    agent.recent_log = preview_line;
+                                    agent.tokens = live_tokens.clone();
+                                }
+                            }
+                            st.update_scoped_chat_message(
+                                &scope_for_evts.session_id,
+                                &reply_id_for_evts,
+                                |m| {
+                                    m.content = streamed_text.clone();
+                                    m.streaming = true;
+                                },
+                            );
+                            if scope_for_evts.session_id == st.active_session_id {
+                                let _ = tx_for_evts.send(
+                                    json!({
+                                        "type": "CHAT_STREAM_UPDATE",
+                                        "session_id": scope_for_evts.session_id,
+                                        "active_session_id": scope_for_evts.session_id,
+                                        "agents": st.agents,
+                                        "chat_thread": st.chat_thread
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                        }
+                        AgyParsedEvent::Result { .. } => {
+                            break;
+                        }
+                    }
+                }
+
+                step_counter
+            };
+
+            let (outcome, step_counter) = tokio::join!(
+                run_agy_streaming_turn(
+                    &agy_bin,
+                    &scope.workspace_path,
+                    &scope.project_id,
+                    &provider_id,
+                    &model,
+                    existing_conv_id.as_deref(),
+                    &prompt,
+                    &mut abort_rx,
+                    move |evt| {
+                        let _ = evt_tx.send(evt);
+                    },
+                ),
+                event_consumer
+            );
+
+            match outcome {
+                AgyStreamOutcome::Aborted => {
+                    return;
+                }
+                AgyStreamOutcome::Completed {
+                    text: streamed_text,
+                    tokens: final_tokens,
+                    interactive_questions,
+                } => {
+                    let reply_interactive = if !interactive_questions.is_empty() {
+                        Some(InteractivePrompt {
+                            prompt_id: format!("ask-{}", node_id),
+                            step_index: step_counter + 1,
+                            status: "Pending".to_string(),
+                            questions: interactive_questions,
+                            answers: Vec::new(),
+                        })
+                    } else {
+                        None
+                    };
+
+                    let mut final_tools = Vec::new();
+                    let mut final_thinking = None;
+                    let cached_test = {
+                        let mut st = state.write().await;
+                        if scope.session_id == st.active_session_id {
+                            st.agents.retain(|a| a.agent_id != task_node_id);
+
+                            if let Some(agent) =
+                                st.agents.iter_mut().find(|a| a.agent_id == node_id)
+                            {
+                                for tc in &mut agent.tool_calls {
+                                    tc.status = "Completed".to_string();
+                                }
+                                if let Some(ref ip) = reply_interactive {
+                                    if !agent.tool_calls.iter().any(|t| t.name == "ask_question") {
+                                        agent.tool_calls.push(ToolCall {
+                                            name: "ask_question".to_string(),
+                                            summary: ip
+                                                .questions
+                                                .first()
+                                                .map(|q| q.question.chars().take(68).collect())
+                                                .unwrap_or_else(|| {
+                                                    "Interactive question".to_string()
+                                                }),
+                                            status: "Completed".to_string(),
+                                        });
+                                    }
+                                }
+                                final_tools = agent.tool_calls.clone();
+                                if !agent.thinking.is_empty() {
+                                    final_thinking = Some(agent.thinking.clone());
+                                }
+                                agent.status = if reply_interactive.is_some() {
+                                    "AwaitingUserInput".to_string()
+                                } else {
+                                    "Completed".to_string()
+                                };
+                                agent.interactive_prompt = reply_interactive.clone();
+                                agent.tokens = final_tokens.clone();
+                                agent.outputs.push(streamed_text.clone());
+                            }
+
+                            if let Some(root) = st.agents.first_mut() {
+                                root.status = if reply_interactive.is_some() {
+                                    "AwaitingUserInput".to_string()
+                                } else {
+                                    "Completed".to_string()
+                                };
+                                root.recent_log = streamed_text
+                                    .lines()
+                                    .find(|l| !l.trim().is_empty())
+                                    .unwrap_or("Completed")
+                                    .chars()
+                                    .take(85)
+                                    .collect();
+                            }
+
+                            if reply_interactive.is_none() {
+                                st.agents.retain(|a| a.agent_id != node_id);
+                            }
+                        }
+
+                        st.update_scoped_chat_message(&scope.session_id, &reply_id, |m| {
+                            for tc in &mut m.tool_calls {
+                                tc.status = "Completed".to_string();
+                            }
+                            if let Some(ref ip) = reply_interactive {
+                                if !m.tool_calls.iter().any(|t| t.name == "ask_question") {
+                                    m.tool_calls.push(ToolCall {
+                                        name: "ask_question".to_string(),
+                                        summary: ip
+                                            .questions
+                                            .first()
+                                            .map(|q| q.question.chars().take(68).collect())
+                                            .unwrap_or_else(|| "Interactive question".to_string()),
+                                        status: "Completed".to_string(),
+                                    });
+                                }
+                            }
+                            if !final_tools.is_empty() {
+                                m.tool_calls = final_tools.clone();
+                            } else {
+                                final_tools = m.tool_calls.clone();
+                            }
+                            if final_thinking.is_none() {
+                                final_thinking = m.thinking.clone();
+                            }
+                            m.content = streamed_text.clone();
+                            m.streaming = false;
+                            m.interactive_prompt = reply_interactive.clone();
+                        });
+
+                        st.active_runs.remove(&node_id);
+
+                        if scope.session_id == st.active_session_id {
+                            let _ = tx.send(
+                                json!({
+                                    "type": "CHAT_STREAM_UPDATE",
+                                    "session_id": scope.session_id,
+                                    "active_session_id": scope.session_id,
+                                    "agents": st.agents,
+                                    "chat_thread": st.chat_thread
+                                })
+                                .to_string(),
+                            );
+                            let _ = tx.send(
+                                json!({
+                                    "type": "AGENTS_UPDATED",
+                                    "session_id": scope.session_id,
+                                    "active_session_id": scope.session_id,
+                                    "agents": st.agents
+                                })
+                                .to_string(),
+                            );
+                        }
+                        st.devops_tests.get(&scope.project_id).cloned()
+                    };
+
+                    append_turn_to_session_transcript(
+                        &scope.session_id,
+                        &prompt,
+                        &streamed_text,
+                        &final_tools,
+                        final_thinking.as_deref(),
+                        &final_tokens,
+                    );
+
+                    let devops = build_workspace_devops_snapshot(
+                        &scope.project_id,
+                        cached_test,
+                        active_server_port(),
+                    );
+                    let _ = tx.send(
+                        json!({
+                            "type": "DEVOPS_UPDATED",
+                            "devops": devops
+                        })
+                        .to_string(),
+                    );
+                    return;
+                }
+                AgyStreamOutcome::CliError(_) => {}
+            }
+        }
+    }
 
     // Emit an in-place tool transition so the user sees the active task update in place before output streams
     tokio::select! {
@@ -541,47 +1038,40 @@ pub async fn run_independent_prompt(
             } else {
                 "edit_file".to_string()
             },
-            summary: format!("~/code/{}: {}", scope.project_id, prompt.chars().take(46).collect::<String>()),
+            summary: format!(
+                "~/code/{}: {}",
+                scope.project_id,
+                prompt.chars().take(46).collect::<String>()
+            ),
             status: "Running".to_string(),
         };
-        let task_node_id = format!("task-{}", node_id);
-        if let Some(tn) = st.agents.iter_mut().find(|a| a.agent_id == task_node_id) {
-            tn.model = format!("TASK • {}", step2_tool.name);
-            tn.role = step2_tool.summary.chars().take(32).collect();
-            tn.recent_log = format!("{} → {}", step2_tool.name, step2_tool.summary);
-            tn.execution_step = 2;
+        if scope.session_id == st.active_session_id {
+            if let Some(tn) = st.agents.iter_mut().find(|a| a.agent_id == task_node_id) {
+                tn.model = format!("TASK • {}", step2_tool.name);
+                tn.role = step2_tool.summary.chars().take(32).collect();
+                tn.recent_log = format!("{} → {}", step2_tool.name, step2_tool.summary);
+                tn.execution_step = 2;
+            }
+            if let Some(agent) = st.agents.iter_mut().find(|a| a.agent_id == node_id) {
+                if let Some(tc) = agent.tool_calls.first_mut() {
+                    tc.status = "Completed".to_string();
+                }
+                agent.tool_calls.push(step2_tool.clone());
+                agent.execution_step = 2;
+            }
         }
-        if let Some(agent) = st.agents.iter_mut().find(|a| a.agent_id == node_id) {
-            if let Some(tc) = agent.tool_calls.first_mut() {
+        st.update_scoped_chat_message(&scope.session_id, &reply_id, |m| {
+            if let Some(tc) = m.tool_calls.first_mut() {
                 tc.status = "Completed".to_string();
             }
-            agent.tool_calls.push(step2_tool.clone());
-            agent.execution_step = 2;
-        }
-        if let Some(scoped_vec) = st.session_custom_messages.get_mut(&scope.session_id) {
-            if let Some(m) = scoped_vec.iter_mut().find(|m| m.id == reply_id) {
-                if let Some(tc) = m.tool_calls.first_mut() {
-                    tc.status = "Completed".to_string();
-                }
-                m.tool_calls.push(step2_tool.clone());
-            }
-        }
+            m.tool_calls.push(step2_tool.clone());
+        });
         if scope.session_id == st.active_session_id {
-            if let Some(m) = st.custom_chat_messages.iter_mut().find(|m| m.id == reply_id) {
-                if let Some(tc) = m.tool_calls.first_mut() {
-                    tc.status = "Completed".to_string();
-                }
-                m.tool_calls.push(step2_tool.clone());
-            }
-            if let Some(m) = st.chat_thread.iter_mut().find(|m| m.id == reply_id) {
-                if let Some(tc) = m.tool_calls.first_mut() {
-                    tc.status = "Completed".to_string();
-                }
-                m.tool_calls.push(step2_tool);
-            }
             let _ = tx.send(
                 json!({
                     "type": "CHAT_STREAM_UPDATE",
+                    "session_id": scope.session_id,
+                    "active_session_id": scope.session_id,
                     "agents": st.agents,
                     "chat_thread": st.chat_thread
                 })
@@ -611,6 +1101,11 @@ pub async fn run_independent_prompt(
     let reply_text = res.text.clone();
     let mut reply_tools = Vec::new();
     let mut reply_thinking = None;
+    let mut reply_tokens = TokenMetrics {
+        input_tokens: (prompt.len() as u64 / 3) + 320,
+        cache_read_tokens: 900,
+        output_tokens: (res.text.len() as u64 / 3).max(48),
+    };
     let reply_interactive = if !res.interactive_questions.is_empty() {
         Some(InteractivePrompt {
             prompt_id: format!("ask-{}", node_id),
@@ -625,69 +1120,112 @@ pub async fn run_independent_prompt(
 
     {
         let mut st = state.write().await;
-        let task_node_id = format!("task-{}", node_id);
-        st.agents.retain(|a| a.agent_id != task_node_id);
+        if scope.session_id == st.active_session_id {
+            st.agents.retain(|a| a.agent_id != task_node_id);
 
-        if let Some(agent) = st.agents.iter_mut().find(|a| a.agent_id == node_id) {
-            agent.status = if reply_interactive.is_some() {
-                "AwaitingUserInput".to_string()
-            } else if p_info.model_class == "DECISION_SYSTEM_1" {
-                "DecisionGate".to_string()
-            } else {
-                "Completed".to_string()
-            };
-            agent.execution_step = 3;
-            agent.tokens.output_tokens = (res.text.len() as u64 / 3).max(48);
-            agent.decision_eval = res.decision_eval.clone();
-            agent.interactive_prompt = reply_interactive.clone();
-            agent.recent_log = if let Some(ref ip) = reply_interactive {
-                format!(
-                    "❓ Awaiting user input ({} question{})",
-                    ip.questions.len(),
-                    if ip.questions.len() == 1 { "" } else { "s" }
-                )
-            } else if let Some(ref de) = res.decision_eval {
-                format!(
-                    "NOUL:{:.2} • {} • {}ms",
-                    de.noul_risk_prob, de.choice_action, de.latency_ms
-                )
-            } else {
-                res.text
+            if let Some(agent) = st.agents.iter_mut().find(|a| a.agent_id == node_id) {
+                agent.status = if reply_interactive.is_some() {
+                    "AwaitingUserInput".to_string()
+                } else if p_info.model_class == "DECISION_SYSTEM_1" {
+                    "DecisionGate".to_string()
+                } else {
+                    "Completed".to_string()
+                };
+                agent.execution_step = 3;
+                agent.tokens.output_tokens = (res.text.len() as u64 / 3).max(48);
+                reply_tokens = agent.tokens.clone();
+                agent.decision_eval = res.decision_eval.clone();
+                agent.interactive_prompt = reply_interactive.clone();
+                agent.recent_log = if let Some(ref ip) = reply_interactive {
+                    format!(
+                        "❓ Awaiting user input ({} question{})",
+                        ip.questions.len(),
+                        if ip.questions.len() == 1 { "" } else { "s" }
+                    )
+                } else if let Some(ref de) = res.decision_eval {
+                    format!(
+                        "NOUL:{:.2} • {} • {}ms",
+                        de.noul_risk_prob, de.choice_action, de.latency_ms
+                    )
+                } else {
+                    res.text
+                        .lines()
+                        .next()
+                        .unwrap_or("Completed")
+                        .chars()
+                        .take(85)
+                        .collect()
+                };
+                for tc in &mut agent.tool_calls {
+                    tc.status = "Completed".to_string();
+                }
+                if let Some(ref ip) = reply_interactive {
+                    agent.tool_calls.push(ToolCall {
+                        name: "ask_question".to_string(),
+                        summary: ip
+                            .questions
+                            .first()
+                            .map(|q| q.question.chars().take(68).collect())
+                            .unwrap_or_else(|| "Interactive question".to_string()),
+                        status: "Completed".to_string(),
+                    });
+                }
+                reply_tools = agent.tool_calls.clone();
+                if !agent.thinking.is_empty() {
+                    reply_thinking = Some(agent.thinking.clone());
+                }
+                agent.outputs.push(res.text);
+            }
+
+            if let Some(root) = st.agents.first_mut() {
+                root.status = if reply_interactive.is_some() {
+                    "AwaitingUserInput".to_string()
+                } else {
+                    "Completed".to_string()
+                };
+                root.recent_log = reply_text
                     .lines()
-                    .next()
+                    .find(|l| !l.trim().is_empty())
                     .unwrap_or("Completed")
                     .chars()
                     .take(85)
-                    .collect()
-            };
-            for tc in &mut agent.tool_calls {
-                tc.status = "Completed".to_string();
+                    .collect();
             }
-            if let Some(ref ip) = reply_interactive {
-                agent.tool_calls.push(ToolCall {
-                    name: "ask_question".to_string(),
-                    summary: ip
-                        .questions
-                        .first()
-                        .map(|q| q.question.chars().take(68).collect())
-                        .unwrap_or_else(|| "Interactive question".to_string()),
-                    status: "Completed".to_string(),
-                });
-            }
-            reply_tools = agent.tool_calls.clone();
-            if !agent.thinking.is_empty() {
-                reply_thinking = Some(agent.thinking.clone());
-            }
-            agent.outputs.push(res.text);
-        }
 
-        let _ = tx.send(
-            json!({
-                "type": "AGENTS_UPDATED",
-                "agents": st.agents
-            })
-            .to_string(),
-        );
+            let _ = tx.send(
+                json!({
+                    "type": "AGENTS_UPDATED",
+                    "session_id": scope.session_id,
+                    "active_session_id": scope.session_id,
+                    "agents": st.agents
+                })
+                .to_string(),
+            );
+        } else if let Some(msgs) = st.session_custom_messages.get(&scope.session_id) {
+            if let Some(m) = msgs.iter().find(|m| m.id == reply_id) {
+                reply_tools = m
+                    .tool_calls
+                    .iter()
+                    .cloned()
+                    .map(|mut tc| {
+                        tc.status = "Completed".to_string();
+                        tc
+                    })
+                    .collect();
+                if let Some(ref ip) = reply_interactive {
+                    reply_tools.push(ToolCall {
+                        name: "ask_question".to_string(),
+                        summary: ip
+                            .questions
+                            .first()
+                            .map(|q| q.question.chars().take(68).collect())
+                            .unwrap_or_else(|| "Interactive question".to_string()),
+                        status: "Completed".to_string(),
+                    });
+                }
+                reply_thinking = m.thinking.clone();
+            }
+        }
     }
 
     stream_text_into_chat_message(
@@ -696,23 +1234,34 @@ pub async fn run_independent_prompt(
         &scope.session_id,
         &reply_id,
         &reply_text,
-        reply_thinking,
-        reply_tools,
+        reply_thinking.clone(),
+        reply_tools.clone(),
         reply_interactive.clone(),
         abort_rx.clone(),
     )
     .await;
+
+    append_turn_to_session_transcript(
+        &scope.session_id,
+        &prompt,
+        &reply_text,
+        &reply_tools,
+        reply_thinking.as_deref(),
+        &reply_tokens,
+    );
 
     {
         let mut st = state.write().await;
         st.active_runs.remove(&node_id);
         // Once the subagent has finished streaming and is not waiting on an interactive question,
         // remove the completed subagent node from the graph so only active subagents/tasks remain!
-        if reply_interactive.is_none() {
+        if reply_interactive.is_none() && scope.session_id == st.active_session_id {
             st.agents.retain(|a| a.agent_id != node_id);
             let _ = tx.send(
                 json!({
                     "type": "AGENTS_UPDATED",
+                    "session_id": scope.session_id,
+                    "active_session_id": scope.session_id,
                     "agents": st.agents
                 })
                 .to_string(),
@@ -747,14 +1296,34 @@ pub async fn submit_interactive_answer(
         let mut found_provider = provider_id.clone();
         let mut found_model = model_override.clone();
 
-        if let Some(scoped_vec) = st.session_custom_messages.get_mut(&active_sess) {
-            for m in scoped_vec.iter_mut() {
+        let matching_msg_ids: Vec<String> = st
+            .session_custom_messages
+            .get(&active_sess)
+            .into_iter()
+            .flatten()
+            .chain(st.custom_chat_messages.iter())
+            .chain(st.chat_thread.iter())
+            .filter(|m| {
+                m.interactive_prompt
+                    .as_ref()
+                    .map(|ip| ip.prompt_id == prompt_id)
+                    .unwrap_or(false)
+            })
+            .map(|m| m.id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        for msg_id in matching_msg_ids {
+            st.update_scoped_chat_message(&active_sess, &msg_id, |m| {
                 if let Some(ref mut ip) = m.interactive_prompt {
                     if ip.prompt_id == prompt_id {
                         ip.status = "Answered".to_string();
                         ip.answers = answers.clone();
-                        for q in &ip.questions {
-                            question_context.push(format!("Q{}: {}", q.index, q.question));
+                        if question_context.is_empty() {
+                            for q in &ip.questions {
+                                question_context.push(format!("Q{}: {}", q.index, q.question));
+                            }
                         }
                         if !m.provider.is_empty() && m.provider != "user" {
                             found_provider = m.provider.clone();
@@ -764,37 +1333,19 @@ pub async fn submit_interactive_answer(
                         }
                     }
                 }
-            }
+            });
         }
 
-        for m in st.custom_chat_messages.iter_mut() {
-            if let Some(ref mut ip) = m.interactive_prompt {
-                if ip.prompt_id == prompt_id {
-                    ip.status = "Answered".to_string();
-                    ip.answers = answers.clone();
-                    if question_context.is_empty() {
-                        for q in &ip.questions {
-                            question_context.push(format!("Q{}: {}", q.index, q.question));
+        if active_sess == st.active_session_id {
+            for a in st.agents.iter_mut() {
+                if let Some(ref mut ip) = a.interactive_prompt {
+                    if ip.prompt_id == prompt_id {
+                        ip.status = "Answered".to_string();
+                        ip.answers = answers.clone();
+                        if a.status == "AwaitingUserInput" {
+                            a.status = "Completed".to_string();
+                            a.recent_log = "✓ Interactive clarification answered".to_string();
                         }
-                    }
-                    if !m.provider.is_empty() && m.provider != "user" {
-                        found_provider = m.provider.clone();
-                    }
-                    if !m.model.is_empty() {
-                        found_model = Some(m.model.clone());
-                    }
-                }
-            }
-        }
-
-        for a in st.agents.iter_mut() {
-            if let Some(ref mut ip) = a.interactive_prompt {
-                if ip.prompt_id == prompt_id {
-                    ip.status = "Answered".to_string();
-                    ip.answers = answers.clone();
-                    if a.status == "AwaitingUserInput" {
-                        a.status = "Completed".to_string();
-                        a.recent_log = "✓ Interactive clarification answered".to_string();
                     }
                 }
             }
@@ -813,25 +1364,27 @@ pub async fn submit_interactive_answer(
         }
         if active_sess == st.active_session_id {
             st.chat_thread = refreshed_chat;
-        }
 
-        let refreshed_nodes = build_live_session_graph(&active_sess, &st.active_project);
-        for rn in refreshed_nodes {
-            if let Some(existing) = st.agents.iter_mut().find(|a| a.agent_id == rn.agent_id) {
-                existing.status = rn.status;
-                existing.interactive_prompt = rn.interactive_prompt;
-                existing.recent_log = rn.recent_log;
+            let refreshed_nodes = build_live_session_graph(&active_sess, &st.active_project);
+            for rn in refreshed_nodes {
+                if let Some(existing) = st.agents.iter_mut().find(|a| a.agent_id == rn.agent_id) {
+                    existing.status = rn.status;
+                    existing.interactive_prompt = rn.interactive_prompt;
+                    existing.recent_log = rn.recent_log;
+                }
             }
-        }
 
-        let _ = tx.send(
-            json!({
-                "type": "LIVE_BRAIN_UPDATE",
-                "agents": st.agents,
-                "chat_thread": st.chat_thread
-            })
-            .to_string(),
-        );
+            let _ = tx.send(
+                json!({
+                    "type": "LIVE_BRAIN_UPDATE",
+                    "session_id": active_sess,
+                    "active_session_id": active_sess,
+                    "agents": st.agents,
+                    "chat_thread": st.chat_thread
+                })
+                .to_string(),
+            );
+        }
 
         (found_provider, found_model, st.active_project.clone())
     };
@@ -895,15 +1448,10 @@ pub async fn run_council_session(
         ];
     }
 
-    let jev_enabled = participants.contains(&"jev".to_string()) || true; // Always include Jev System-1 Gate in Council
+    // System-1 Jev Decision Gate always adjudicates Council sessions alongside generative peers
+    let jev_enabled = !generative_chosen.is_empty();
 
-    let council_id = format!(
-        "council-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() % 100000)
-            .unwrap_or(1)
-    );
+    let council_id = next_monotonic_run_id("council");
 
     let (scope, api_keys, provider_map) = {
         let mut st = state.write().await;
@@ -1088,8 +1636,8 @@ pub async fn run_council_session(
         let council_node_ids: Vec<String> = council_nodes.iter().map(|n| n.agent_id.clone()).collect();
         if resolved_scope.session_id == st.active_session_id {
             st.agents = council_nodes;
+            st.council = Some(session.clone());
         }
-        st.council = Some(session.clone());
         let next_step = st.chat_thread.len() as u32 + 1;
         st.push_or_update_scoped_chat(
             &resolved_scope.session_id,
@@ -1143,15 +1691,19 @@ pub async fn run_council_session(
             },
         );
 
-        let _ = tx.send(
-            json!({
-                "type": "COUNCIL_UPDATED",
-                "council": session,
-                "agents": st.agents,
-                "chat_thread": st.chat_thread
-            })
-            .to_string(),
-        );
+        if resolved_scope.session_id == st.active_session_id {
+            let _ = tx.send(
+                json!({
+                    "type": "COUNCIL_UPDATED",
+                    "session_id": resolved_scope.session_id,
+                    "active_session_id": resolved_scope.session_id,
+                    "council": session,
+                    "agents": st.agents,
+                    "chat_thread": st.chat_thread
+                })
+                .to_string(),
+            );
+        }
 
         (resolved_scope, st.api_keys.clone(), p_map)
     };
@@ -1229,68 +1781,75 @@ pub async fn run_council_session(
     // Transition to Stage 2: Cross-Critique & Negotiation
     {
         let mut st = state.write().await;
-        let jev_node_id = format!("{}-jev-gate", council_id);
+        if scope.session_id == st.active_session_id {
+            let jev_node_id = format!("{}-jev-gate", council_id);
 
-        for prop in &proposals {
-            if let Some(node) = st.agents.iter_mut().find(|a| a.agent_id == prop.agent_id) {
-                node.status = "Negotiating".to_string();
-                node.execution_step = 2;
-                node.tokens.output_tokens = (prop.initial_draft.len() as u64 / 3).max(90);
-                node.thinking =
-                    "Stage 2/3: Reviewing peer proposals & formulating adversarial critique..."
-                        .to_string();
-                node.recent_log = format!("Drafted in {}ms • Critiquing peers...", prop.latency_ms);
-                node.outputs = vec![prop.initial_draft.clone()];
-                if let Some(tc) = node.tool_calls.first_mut() {
+            for prop in &proposals {
+                if let Some(node) = st.agents.iter_mut().find(|a| a.agent_id == prop.agent_id) {
+                    node.status = "Negotiating".to_string();
+                    node.execution_step = 2;
+                    node.tokens.output_tokens = (prop.initial_draft.len() as u64 / 3).max(90);
+                    node.thinking =
+                        "Stage 2/3: Reviewing peer proposals & formulating adversarial critique..."
+                            .to_string();
+                    node.recent_log =
+                        format!("Drafted in {}ms • Critiquing peers...", prop.latency_ms);
+                    node.outputs = vec![prop.initial_draft.clone()];
+                    if let Some(tc) = node.tool_calls.first_mut() {
+                        tc.status = "Completed".to_string();
+                    }
+                    node.tool_calls.push(ToolCall {
+                        name: "cross_critique_peers".to_string(),
+                        summary: "Stage 2: Reviewing peer proposals".to_string(),
+                        status: "Running".to_string(),
+                    });
+                }
+            }
+
+            if let Some(jev_node) = st.agents.iter_mut().find(|a| a.agent_id == jev_node_id) {
+                jev_node.status = "DecisionGate".to_string();
+                jev_node.execution_step = 2;
+                jev_node.decision_eval = Some(jev_gate_eval.clone());
+                jev_node.recent_log = format!(
+                    "NOUL:{:.2} • {} ({}ms)",
+                    jev_gate_eval.noul_risk_prob,
+                    jev_gate_eval.choice_action,
+                    jev_gate_eval.latency_ms
+                );
+                jev_node.outputs = vec![format!(
+                    "Jev System-1 Pre-Flight & Proposal Rubric Complete ({}ms):\n• Risk NOUL: {:.2}\n• Route CHOICE: {}\n• Rubric SCORE: {}",
+                    jev_gate_eval.latency_ms,
+                    jev_gate_eval.noul_risk_prob,
+                    jev_gate_eval.choice_action,
+                    jev_gate_eval.score_rubric
+                )];
+                if let Some(tc) = jev_node.tool_calls.first_mut() {
                     tc.status = "Completed".to_string();
                 }
-                node.tool_calls.push(ToolCall {
-                    name: "cross_critique_peers".to_string(),
-                    summary: "Stage 2: Reviewing peer proposals".to_string(),
-                    status: "Running".to_string(),
-                });
             }
-        }
 
-        if let Some(jev_node) = st.agents.iter_mut().find(|a| a.agent_id == jev_node_id) {
-            jev_node.status = "DecisionGate".to_string();
-            jev_node.execution_step = 2;
-            jev_node.decision_eval = Some(jev_gate_eval.clone());
-            jev_node.recent_log = format!(
-                "NOUL:{:.2} • {} ({}ms)",
-                jev_gate_eval.noul_risk_prob, jev_gate_eval.choice_action, jev_gate_eval.latency_ms
+            if let Some(chair) = st.agents.first_mut() {
+                chair.execution_step = 2;
+                chair.recent_log = "Stage 2: Cross-Critique & Jev Rubric Scoring".to_string();
+            }
+            if let Some(ref mut c) = st.council {
+                c.stage = "STAGE_2_NEGOTIATION".to_string();
+                c.stage_number = 2;
+                c.proposals = proposals.clone();
+                c.jev_gate_summary = Some(jev_gate_eval.clone());
+            }
+
+            let _ = tx.send(
+                json!({
+                    "type": "COUNCIL_UPDATED",
+                    "session_id": scope.session_id,
+                    "active_session_id": scope.session_id,
+                    "council": st.council,
+                    "agents": st.agents
+                })
+                .to_string(),
             );
-            jev_node.outputs = vec![format!(
-                "Jev System-1 Pre-Flight & Proposal Rubric Complete ({}ms):\n• Risk NOUL: {:.2}\n• Route CHOICE: {}\n• Rubric SCORE: {}",
-                jev_gate_eval.latency_ms,
-                jev_gate_eval.noul_risk_prob,
-                jev_gate_eval.choice_action,
-                jev_gate_eval.score_rubric
-            )];
-            if let Some(tc) = jev_node.tool_calls.first_mut() {
-                tc.status = "Completed".to_string();
-            }
         }
-
-        if let Some(chair) = st.agents.first_mut() {
-            chair.execution_step = 2;
-            chair.recent_log = "Stage 2: Cross-Critique & Jev Rubric Scoring".to_string();
-        }
-        if let Some(ref mut c) = st.council {
-            c.stage = "STAGE_2_NEGOTIATION".to_string();
-            c.stage_number = 2;
-            c.proposals = proposals.clone();
-            c.jev_gate_summary = Some(jev_gate_eval.clone());
-        }
-
-        let _ = tx.send(
-            json!({
-                "type": "COUNCIL_UPDATED",
-                "council": st.council,
-                "agents": st.agents
-            })
-            .to_string(),
-        );
     }
 
     // =========================================================================
@@ -1332,40 +1891,45 @@ pub async fn run_council_session(
     // Transition to Stage 3: Ranked-Choice Voting
     {
         let mut st = state.write().await;
-        for prop in &proposals {
-            if let Some(node) = st.agents.iter_mut().find(|a| a.agent_id == prop.agent_id) {
-                node.status = "Voting".to_string();
-                node.execution_step = 3;
-                node.thinking =
-                    "Stage 3/3: Casting Ranked-Choice Borda Ballot (no self-voting)...".to_string();
-                node.recent_log = "Stage 3: Casting Ranked-Choice Vote...".to_string();
-                if let Some(tc) = node.tool_calls.last_mut() {
-                    tc.status = "Completed".to_string();
-                }
-                if let Some(ref rev) = prop.revised_draft {
-                    node.outputs = vec![rev.clone()];
+        if scope.session_id == st.active_session_id {
+            for prop in &proposals {
+                if let Some(node) = st.agents.iter_mut().find(|a| a.agent_id == prop.agent_id) {
+                    node.status = "Voting".to_string();
+                    node.execution_step = 3;
+                    node.thinking =
+                        "Stage 3/3: Casting Ranked-Choice Borda Ballot (no self-voting)..."
+                            .to_string();
+                    node.recent_log = "Stage 3: Casting Ranked-Choice Vote...".to_string();
+                    if let Some(tc) = node.tool_calls.last_mut() {
+                        tc.status = "Completed".to_string();
+                    }
+                    if let Some(ref rev) = prop.revised_draft {
+                        node.outputs = vec![rev.clone()];
+                    }
                 }
             }
-        }
-        if let Some(arbiter) = st.agents.last_mut() {
-            arbiter.status = "Running".to_string();
-            arbiter.execution_step = 1;
-            arbiter.recent_log = "Tallying Borda ballots + Jev System-1 scores...".to_string();
-        }
-        if let Some(ref mut c) = st.council {
-            c.stage = "STAGE_3_VOTING".to_string();
-            c.stage_number = 3;
-            c.proposals = proposals.clone();
-        }
+            if let Some(arbiter) = st.agents.last_mut() {
+                arbiter.status = "Running".to_string();
+                arbiter.execution_step = 1;
+                arbiter.recent_log = "Tallying Borda ballots + Jev System-1 scores...".to_string();
+            }
+            if let Some(ref mut c) = st.council {
+                c.stage = "STAGE_3_VOTING".to_string();
+                c.stage_number = 3;
+                c.proposals = proposals.clone();
+            }
 
-        let _ = tx.send(
-            json!({
-                "type": "COUNCIL_UPDATED",
-                "council": st.council,
-                "agents": st.agents
-            })
-            .to_string(),
-        );
+            let _ = tx.send(
+                json!({
+                    "type": "COUNCIL_UPDATED",
+                    "session_id": scope.session_id,
+                    "active_session_id": scope.session_id,
+                    "council": st.council,
+                    "agents": st.agents
+                })
+                .to_string(),
+            );
+        }
     }
 
     // =========================================================================
@@ -1577,55 +2141,57 @@ pub async fn run_council_session(
     // Finalize Council State & Update Graph Nodes
     {
         let mut st = state.write().await;
-        let arbiter_id = format!("{}-arbiter", council_id);
+        if scope.session_id == st.active_session_id {
+            let arbiter_id = format!("{}-arbiter", council_id);
 
-        for entry in &leaderboard {
-            let node_id = format!("council-{}", entry.provider_id);
-            if let Some(node) = st.agents.iter_mut().find(|a| a.agent_id == node_id) {
-                node.council_score = Some(entry.weighted_score);
-                node.is_council_winner = entry.is_winner;
-                node.status = if entry.is_winner {
-                    "Winner".to_string()
-                } else {
-                    "Completed".to_string()
-                };
-                node.recent_log = if entry.is_winner {
-                    format!(
-                        "🏆 WINNER • {:.2} pts ({} #1 votes + Jev +{:.1})",
-                        entry.weighted_score, entry.first_place_votes, entry.jev_gate_bonus
-                    )
-                } else {
-                    format!(
-                        "{:.1} Borda + {:.1} Jev = {:.2} pts",
-                        entry.borda_points, entry.jev_gate_bonus, entry.weighted_score
-                    )
-                };
+            for entry in &leaderboard {
+                let node_id = format!("council-{}", entry.provider_id);
+                if let Some(node) = st.agents.iter_mut().find(|a| a.agent_id == node_id) {
+                    node.council_score = Some(entry.weighted_score);
+                    node.is_council_winner = entry.is_winner;
+                    node.status = if entry.is_winner {
+                        "Winner".to_string()
+                    } else {
+                        "Completed".to_string()
+                    };
+                    node.recent_log = if entry.is_winner {
+                        format!(
+                            "🏆 WINNER • {:.2} pts ({} #1 votes + Jev +{:.1})",
+                            entry.weighted_score, entry.first_place_votes, entry.jev_gate_bonus
+                        )
+                    } else {
+                        format!(
+                            "{:.1} Borda + {:.1} Jev = {:.2} pts",
+                            entry.borda_points, entry.jev_gate_bonus, entry.weighted_score
+                        )
+                    };
+                }
             }
-        }
 
-        if let Some(chair) = st.agents.first_mut() {
-            chair.status = "Completed".to_string();
-            chair.execution_step = 3;
-            chair.recent_log = format!("Council Consensus reached → {}", winner_name);
-        }
+            if let Some(chair) = st.agents.first_mut() {
+                chair.status = "Completed".to_string();
+                chair.execution_step = 3;
+                chair.recent_log = format!("Council Consensus reached → {}", winner_name);
+            }
 
-        if let Some(arbiter) = st.agents.iter_mut().find(|a| a.agent_id == arbiter_id) {
-            arbiter.parent_id = format!("council-{}", winner_id);
-            arbiter.status = "Winner".to_string();
-            arbiter.execution_step = 3;
-            arbiter.is_council_winner = true;
-            arbiter.council_score = Some(winner_score);
-            arbiter.recent_log = format!("Synthesized winning solution from {}", winner_name);
-            arbiter.outputs = vec![synthesized.clone()];
-        }
+            if let Some(arbiter) = st.agents.iter_mut().find(|a| a.agent_id == arbiter_id) {
+                arbiter.parent_id = format!("council-{}", winner_id);
+                arbiter.status = "Winner".to_string();
+                arbiter.execution_step = 3;
+                arbiter.is_council_winner = true;
+                arbiter.council_score = Some(winner_score);
+                arbiter.recent_log = format!("Synthesized winning solution from {}", winner_name);
+                arbiter.outputs = vec![synthesized.clone()];
+            }
 
-        if let Some(ref mut c) = st.council {
-            c.stage = "COMPLETED".to_string();
-            c.stage_number = 4;
-            c.votes = votes;
-            c.leaderboard = leaderboard;
-            c.winning_provider = Some(winner_name.clone());
-            c.synthesized_output = Some(synthesized.clone());
+            if let Some(ref mut c) = st.council {
+                c.stage = "COMPLETED".to_string();
+                c.stage_number = 4;
+                c.votes = votes;
+                c.leaderboard = leaderboard;
+                c.winning_provider = Some(winner_name.clone());
+                c.synthesized_output = Some(synthesized.clone());
+            }
         }
 
         let next_step = st.chat_thread.len() as u32 + 1;
@@ -1652,15 +2218,19 @@ pub async fn run_council_session(
             },
         );
 
-        let _ = tx.send(
-            json!({
-                "type": "COUNCIL_UPDATED",
-                "council": st.council,
-                "agents": st.agents,
-                "chat_thread": st.chat_thread
-            })
-            .to_string(),
-        );
+        if scope.session_id == st.active_session_id {
+            let _ = tx.send(
+                json!({
+                    "type": "COUNCIL_UPDATED",
+                    "session_id": scope.session_id,
+                    "active_session_id": scope.session_id,
+                    "council": st.council,
+                    "agents": st.agents,
+                    "chat_thread": st.chat_thread
+                })
+                .to_string(),
+            );
+        }
     }
 
     let council_msg_id = format!("council-win-{}", council_id);
@@ -1687,6 +2257,93 @@ pub async fn run_council_session(
 mod tests {
     use super::*;
     use crate::brain::{code_root_dir, extract_project_slug_from_text, resolve_execution_scope};
+
+    #[test]
+    fn anchor_test_monotonic_run_id_and_server_port() {
+        let id1 = next_monotonic_run_id("claude");
+        let id2 = next_monotonic_run_id("claude");
+        assert_ne!(id1, id2, "Monotonic run IDs must never collide");
+        assert!(id1.starts_with("claude-"));
+
+        set_active_server_port(9123);
+        assert_eq!(active_server_port(), 9123);
+        set_active_server_port(0);
+        assert_eq!(active_server_port(), 9000);
+    }
+
+    #[test]
+    fn anchor_test_update_scoped_chat_message_synchronizes_all_three_vectors_only_when_active() {
+        let mut state = SharedAppState {
+            agents: Vec::new(),
+            council: None,
+            active_project: "exo-suit".to_string(),
+            active_session_id: "session-active".to_string(),
+            chat_thread: Vec::new(),
+            custom_chat_messages: Vec::new(),
+            session_custom_messages: HashMap::new(),
+            active_runs: HashMap::new(),
+            devops_tests: HashMap::new(),
+            api_keys: HashMap::new(),
+        };
+
+        state.push_or_update_scoped_chat(
+            "session-active",
+            ChatMessage {
+                id: "msg-1".to_string(),
+                step_index: 1,
+                role: "assistant".to_string(),
+                sender: "Claude".to_string(),
+                provider: "claude".to_string(),
+                model: "claude-4-sonnet".to_string(),
+                timestamp: "12:00:00".to_string(),
+                content: "Initial".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                streaming: true,
+                interactive_prompt: None,
+            },
+        );
+        state.push_or_update_scoped_chat(
+            "session-bg",
+            ChatMessage {
+                id: "msg-bg".to_string(),
+                step_index: 1,
+                role: "assistant".to_string(),
+                sender: "Claude".to_string(),
+                provider: "claude".to_string(),
+                model: "claude-4-sonnet".to_string(),
+                timestamp: "12:00:00".to_string(),
+                content: "Bg Initial".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                streaming: true,
+                interactive_prompt: None,
+            },
+        );
+
+        assert!(state.update_scoped_chat_message("session-active", "msg-1", |m| {
+            m.content = "Updated Active".to_string();
+            m.streaming = false;
+        }));
+        assert_eq!(state.chat_thread[0].content, "Updated Active");
+        assert!(!state.chat_thread[0].streaming);
+        assert_eq!(state.custom_chat_messages[0].content, "Updated Active");
+        assert_eq!(
+            state.session_custom_messages["session-active"][0].content,
+            "Updated Active"
+        );
+
+        assert!(state.update_scoped_chat_message("session-bg", "msg-bg", |m| {
+            m.content = "Updated Bg".to_string();
+            m.streaming = false;
+        }));
+        assert_eq!(state.chat_thread.len(), 1);
+        assert_eq!(state.chat_thread[0].content, "Updated Active");
+        assert_eq!(
+            state.session_custom_messages["session-bg"][0].content,
+            "Updated Bg"
+        );
+    }
 
     #[test]
     fn anchor_test_extract_and_resolve_execution_scope() {

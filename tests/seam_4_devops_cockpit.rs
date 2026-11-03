@@ -1,10 +1,12 @@
+use exo_suit::brain::code_root_dir;
 use exo_suit::devops::{
     build_workspace_devops_snapshot, compute_workspace_diff, detect_test_runner_in_dir,
-    parse_git_porcelain_and_numstat, parse_test_runner_counts, validate_workspace_sandbox,
+    detect_test_runner_spec_in_dir, parse_git_porcelain_and_numstat, parse_test_runner_counts,
+    probe_deploy_and_health, validate_workspace_sandbox, TestRunnerSpec,
 };
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 fn temp_dir(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -18,20 +20,79 @@ fn temp_dir(prefix: &str) -> PathBuf {
 
 #[test]
 fn seam4_validate_workspace_sandbox_enforces_strict_boundary() {
-    assert!(validate_workspace_sandbox("", None).is_none());
-    assert!(validate_workspace_sandbox("../etc", None).is_none());
-    assert!(validate_workspace_sandbox("exo-suit/sub", None).is_none());
-    assert!(validate_workspace_sandbox("non-existent-workspace-999999", None).is_none());
+    assert!(validate_workspace_sandbox("", None).is_err());
+    assert!(validate_workspace_sandbox("../etc", None).is_err());
+    assert!(validate_workspace_sandbox("exo-suit/sub", None).is_err());
+    assert!(validate_workspace_sandbox("non-existent-workspace-999999", None).is_err());
 
     // Rejects target_path traversal
-    assert!(validate_workspace_sandbox("exo-suit", Some("../outside.rs")).is_none());
-    assert!(validate_workspace_sandbox("exo-suit", Some("src/../../outside.rs")).is_none());
+    assert!(validate_workspace_sandbox("exo-suit", Some("../outside.rs")).is_err());
+    assert!(validate_workspace_sandbox("exo-suit", Some("src/../../outside.rs")).is_err());
 
     // Accepts valid workspace and strips leading slash on relative target_path
     let (work_dir, rel) =
         validate_workspace_sandbox("exo-suit", Some("/src/devops.rs")).expect("valid sandbox path");
     assert!(work_dir.ends_with("exo-suit"));
     assert_eq!(rel.as_deref(), Some("src/devops.rs"));
+}
+
+#[test]
+fn seam4_validate_workspace_sandbox_rejects_symlink_escape() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_proj_id = format!(".tmp-sandbox-symlink-{}-{}", std::process::id(), nanos);
+    let work_dir = code_root_dir().join(&temp_proj_id);
+    fs::create_dir_all(&work_dir).expect("create temporary workspace in code root");
+
+    let outside_dir = temp_dir("outside-boundary");
+    let outside_file = outside_dir.join("secret.txt");
+    fs::write(&outside_file, "classified").unwrap();
+
+    let inside_file = work_dir.join("safe.txt");
+    fs::write(&inside_file, "safe").unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink("/etc/hosts", work_dir.join("hosts_link")).expect("create /etc/hosts symlink");
+        symlink(&outside_file, work_dir.join("outside_link"))
+            .expect("create outside temp file symlink");
+        symlink(&outside_dir, work_dir.join("outside_dir_link"))
+            .expect("create outside temp dir symlink");
+        symlink(&inside_file, work_dir.join("inside_link"))
+            .expect("create internal workspace symlink");
+    }
+
+    let err_hosts = validate_workspace_sandbox(&temp_proj_id, Some("hosts_link"))
+        .expect_err("symlink to /etc/hosts must be rejected");
+    assert_eq!(
+        err_hosts,
+        "Sandbox violation: symlink target escapes workspace boundary"
+    );
+
+    let err_outside = validate_workspace_sandbox(&temp_proj_id, Some("outside_link"))
+        .expect_err("symlink to parent temp dir file must be rejected");
+    assert_eq!(
+        err_outside,
+        "Sandbox violation: symlink target escapes workspace boundary"
+    );
+
+    let err_nested =
+        validate_workspace_sandbox(&temp_proj_id, Some("outside_dir_link/nonexistent.txt"))
+            .expect_err("symlink parent directory pointing outside workspace must be rejected");
+    assert_eq!(
+        err_nested,
+        "Sandbox violation: symlink target escapes workspace boundary"
+    );
+
+    let ok_inside = validate_workspace_sandbox(&temp_proj_id, Some("inside_link"))
+        .expect("internal symlink staying inside workspace should succeed");
+    assert_eq!(ok_inside.1.as_deref(), Some("inside_link"));
+
+    let _ = fs::remove_dir_all(&work_dir);
+    let _ = fs::remove_dir_all(&outside_dir);
 }
 
 #[test]
@@ -99,34 +160,75 @@ fn seam4_detect_test_runner_in_dir_supports_polyglot_manifests() {
     fs::write(cargo_dir.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
     assert_eq!(
         detect_test_runner_in_dir(&cargo_dir),
-        ("cargo".to_string(), "cargo test".to_string())
+        Some(("cargo".to_string(), "cargo test".to_string()))
+    );
+    assert_eq!(
+        detect_test_runner_spec_in_dir(&cargo_dir),
+        Some(TestRunnerSpec {
+            framework: "cargo".to_string(),
+            program: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            display_command: "cargo test".to_string(),
+        })
     );
 
     let npm_dir = temp_dir("runner-npm");
     fs::write(npm_dir.join("package.json"), "{}").unwrap();
     assert_eq!(
         detect_test_runner_in_dir(&npm_dir),
-        ("npm".to_string(), "npm test".to_string())
+        Some(("npm".to_string(), "npm test".to_string()))
+    );
+    assert_eq!(
+        detect_test_runner_spec_in_dir(&npm_dir),
+        Some(TestRunnerSpec {
+            framework: "npm".to_string(),
+            program: "npm".to_string(),
+            args: vec!["test".to_string()],
+            display_command: "npm test".to_string(),
+        })
     );
 
     let py_dir = temp_dir("runner-pytest");
     fs::write(py_dir.join("pyproject.toml"), "[tool.pytest]\n").unwrap();
     assert_eq!(
         detect_test_runner_in_dir(&py_dir),
-        ("pytest".to_string(), "pytest".to_string())
+        Some(("pytest".to_string(), "pytest".to_string()))
+    );
+    assert_eq!(
+        detect_test_runner_spec_in_dir(&py_dir),
+        Some(TestRunnerSpec {
+            framework: "pytest".to_string(),
+            program: "pytest".to_string(),
+            args: vec![],
+            display_command: "pytest".to_string(),
+        })
     );
 
     let go_dir = temp_dir("runner-go");
     fs::write(go_dir.join("go.mod"), "module example.com/demo\n").unwrap();
     assert_eq!(
         detect_test_runner_in_dir(&go_dir),
-        ("go".to_string(), "go test ./...".to_string())
+        Some(("go".to_string(), "go test ./...".to_string()))
     );
+    assert_eq!(
+        detect_test_runner_spec_in_dir(&go_dir),
+        Some(TestRunnerSpec {
+            framework: "go".to_string(),
+            program: "go".to_string(),
+            args: vec!["test".to_string(), "./...".to_string()],
+            display_command: "go test ./...".to_string(),
+        })
+    );
+
+    let empty_dir = temp_dir("runner-empty");
+    assert_eq!(detect_test_runner_spec_in_dir(&empty_dir), None);
+    assert_eq!(detect_test_runner_in_dir(&empty_dir), None);
 
     let _ = fs::remove_dir_all(&cargo_dir);
     let _ = fs::remove_dir_all(&npm_dir);
     let _ = fs::remove_dir_all(&py_dir);
     let _ = fs::remove_dir_all(&go_dir);
+    let _ = fs::remove_dir_all(&empty_dir);
 }
 
 #[test]
@@ -153,7 +255,7 @@ test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
 
 #[test]
 fn seam4_compute_workspace_diff_synthesizes_untracked_file_and_builds_snapshot() {
-    // `src/lib.rs` is a newly created untracked file in `exo-suit`
+    // `src/lib.rs` is in `exo-suit`
     let diff = compute_workspace_diff("exo-suit", Some("src/lib.rs"));
     assert_eq!(diff.project_id, "exo-suit");
     assert_eq!(diff.target_path.as_deref(), Some("src/lib.rs"));
@@ -169,4 +271,15 @@ fn seam4_compute_workspace_diff_synthesizes_untracked_file_and_builds_snapshot()
     assert_eq!(devops.tests.command, "cargo test");
     assert!(!devops.deploy_health.endpoints.is_empty());
     assert_eq!(devops.deploy_health.endpoints[0].status_code, 200);
+
+    // Verify 15-second TTL deploy health cache returns cached DeployHealthSummary in <1ms
+    let started = Instant::now();
+    let cached_deploy = probe_deploy_and_health("exo-suit", &devops.git, 9000);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed.as_millis() < 1,
+        "Cached probe_deploy_and_health should complete in <1ms, took {:?}",
+        elapsed
+    );
+    assert_eq!(cached_deploy, devops.deploy_health);
 }

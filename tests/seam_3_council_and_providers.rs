@@ -1,7 +1,11 @@
 use exo_suit::{
     council::{ActiveRunHandle, SharedAppState, run_council_session},
     models::ChatMessage,
-    providers::{build_provider_registry, evaluate_jev_decision_gate, sanitize_prob},
+    providers::{
+        AgyParsedEvent, AgyStreamOutcome, build_provider_registry, detect_binary,
+        evaluate_jev_decision_gate, map_provider_to_agy_model, parse_agy_stream_json_line,
+        resolve_api_model_name, run_agy_streaming_turn, sanitize_prob,
+    },
 };
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{RwLock, broadcast, watch};
@@ -226,4 +230,268 @@ fn seam3_scoped_chat_prevents_cross_session_bleed_and_cancels_active_runs() {
         .expect("sess-beta messages must exist");
     assert!(!beta_msgs[0].streaming);
     assert!(beta_msgs[0].content.contains("Stopped by user"));
+}
+
+#[test]
+fn seam3_agy_stream_json_parser_extracts_init_live_tools_deltas_and_results() {
+    assert_eq!(
+        map_provider_to_agy_model("antigravity", "gemini-4-argon"),
+        "gemini-4-argon-medium"
+    );
+    assert_eq!(
+        map_provider_to_agy_model("claude", "claude-4-sonnet"),
+        "claude-sonnet-5-5-medium"
+    );
+    assert_eq!(
+        map_provider_to_agy_model("codex", "codex-mini-latest"),
+        "gpt-oss-120b-medium"
+    );
+
+    // 1. Init event
+    let init_line = r#"{"event":"init","conversation_id":"conv-1234-abcd","init":{"model":"gemini-4-argon-medium","cwd":"/tmp"}}"#;
+    match parse_agy_stream_json_line(init_line, "exo-suit") {
+        Some(AgyParsedEvent::Init { conversation_id }) => {
+            assert_eq!(conversation_id, "conv-1234-abcd");
+        }
+        other => panic!("Expected AgyParsedEvent::Init, got {:?}", other),
+    }
+
+    // 2. Active Tool call event
+    let tool_active_line = r#"{"event":"step_update","step_update":{"conversation_id":"conv-1234-abcd","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"cargo test","toolSummary":"Run Rust test suite"}}}}"#;
+    match parse_agy_stream_json_line(tool_active_line, "exo-suit") {
+        Some(AgyParsedEvent::ToolActive {
+            step_index,
+            tool_name,
+            summary,
+            ..
+        }) => {
+            assert_eq!(step_index, 2);
+            assert_eq!(tool_name, "run_command");
+            assert_eq!(summary, "Run Rust test suite");
+        }
+        other => panic!("Expected AgyParsedEvent::ToolActive, got {:?}", other),
+    }
+
+    // 3. Tool Done event
+    let tool_done_line = r#"{"event":"step_update","step_update":{"conversation_id":"conv-1234-abcd","step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command"}}"#;
+    match parse_agy_stream_json_line(tool_done_line, "exo-suit") {
+        Some(AgyParsedEvent::ToolDone {
+            step_index,
+            tool_name,
+        }) => {
+            assert_eq!(step_index, 2);
+            assert_eq!(tool_name, "run_command");
+        }
+        other => panic!("Expected AgyParsedEvent::ToolDone, got {:?}", other),
+    }
+
+    // 4. Streaming text delta event
+    let delta_line = r#"{"event":"step_update","step_update":{"conversation_id":"conv-1234-abcd","step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"All 30 tests passed."}}"#;
+    match parse_agy_stream_json_line(delta_line, "exo-suit") {
+        Some(AgyParsedEvent::TextDelta { delta, .. }) => {
+            assert_eq!(delta, "All 30 tests passed.");
+        }
+        other => panic!("Expected AgyParsedEvent::TextDelta, got {:?}", other),
+    }
+
+    // 5. Final Result event
+    let result_line = r#"{"event":"result","result":{"conversation_id":"conv-1234-abcd","status":"SUCCESS","response":"All 30 tests passed.\n","usage":{"input_tokens":14095,"output_tokens":75,"cache_read_tokens":9823}}}"#;
+    match parse_agy_stream_json_line(result_line, "exo-suit") {
+        Some(AgyParsedEvent::Result {
+            conversation_id,
+            response,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+        }) => {
+            assert_eq!(conversation_id, "conv-1234-abcd");
+            assert_eq!(response, "All 30 tests passed.\n");
+            assert_eq!(input_tokens, 14095);
+            assert_eq!(output_tokens, 75);
+            assert_eq!(cache_read_tokens, 9823);
+        }
+        other => panic!("Expected AgyParsedEvent::Result, got {:?}", other),
+    }
+}
+
+#[test]
+fn seam3_resolve_api_model_name_preserves_user_selected_models_and_defaults() {
+    assert_eq!(
+        resolve_api_model_name("claude", "claude-4-sonnet"),
+        "claude-4-sonnet"
+    );
+    assert_eq!(
+        resolve_api_model_name("claude", "claude-4-opus"),
+        "claude-4-opus"
+    );
+    assert_eq!(
+        resolve_api_model_name("codex", "gpt-5-codex"),
+        "gpt-5-codex"
+    );
+    assert_eq!(
+        resolve_api_model_name("codex", "codex-mini-latest"),
+        "codex-mini-latest"
+    );
+    assert_eq!(resolve_api_model_name("kimi", "kimi-k2-5"), "kimi-k2-5");
+    assert_eq!(
+        resolve_api_model_name("kimi", "moonshot-v1-128k"),
+        "moonshot-v1-128k"
+    );
+    assert_eq!(
+        resolve_api_model_name("deepseek", "deepseek-reasoner"),
+        "deepseek-reasoner"
+    );
+
+    // Empty or "default" falls back to provider default
+    assert_eq!(resolve_api_model_name("claude", ""), "claude-4-sonnet");
+    assert_eq!(
+        resolve_api_model_name("codex", "default"),
+        "codex-mini-latest"
+    );
+    assert_eq!(resolve_api_model_name("deepseek", ""), "deepseek-chat");
+    assert_eq!(resolve_api_model_name("kimi", ""), "kimi-k2-5");
+}
+
+#[test]
+fn seam3_detect_binary_caches_positive_and_negative_lookups() {
+    let sh_first = detect_binary(&["/bin/sh", "sh"]);
+    let sh_second = detect_binary(&["/bin/sh", "sh"]);
+    assert!(sh_first.is_some());
+    assert_eq!(sh_first, sh_second);
+
+    let missing_first = detect_binary(&["__exo_suit_nonexistent_bin_spec02__"]);
+    let missing_second = detect_binary(&["__exo_suit_nonexistent_bin_spec02__"]);
+    assert_eq!(missing_first, None);
+    assert_eq!(missing_second, None);
+}
+
+#[tokio::test]
+async fn seam3_run_agy_streaming_turn_parses_events_and_captures_cli_errors() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "exo-suit-spec02-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+
+    // 1. Mock script that emits stream-json events and exits 0
+    let ok_script = tmp_dir.join("mock_agy_ok.sh");
+    let script_body = r#"#!/bin/sh
+printf '%s\n' '{"event":"init","conversation_id":"conv-spec02-99"}'
+printf '%s\n' '{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"view_file","tool_info":{"name":"view_file","parameters":{"Path":"src/providers.rs"}}}}'
+printf '%s\n' '{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"tool","tool_name":"view_file"}}'
+printf '%s\n' '{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE","step_type":"agent_response","text_delta":"Streaming gateway verified."}}'
+printf '%s\n' '{"event":"result","result":{"conversation_id":"conv-spec02-99","status":"SUCCESS","response":"Streaming gateway verified.","usage":{"input_tokens":512,"output_tokens":42,"cache_read_tokens":128}}}'
+"#;
+    std::fs::write(&ok_script, script_body).expect("write mock_agy_ok.sh");
+    let mut perms = std::fs::metadata(&ok_script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&ok_script, perms).unwrap();
+
+    let (_abort_tx, mut abort_rx) = watch::channel(false);
+    let mut observed_events = Vec::new();
+
+    let outcome = run_agy_streaming_turn(
+        ok_script.to_str().unwrap(),
+        &tmp_dir,
+        "exo-suit",
+        "antigravity",
+        "gemini-4-argon",
+        Some("conv-spec02-99"),
+        "Verify gateway",
+        &mut abort_rx,
+        |evt| observed_events.push(evt),
+    )
+    .await;
+
+    assert_eq!(observed_events.len(), 5);
+    assert!(matches!(
+        observed_events[0],
+        AgyParsedEvent::Init {
+            ref conversation_id
+        } if conversation_id == "conv-spec02-99"
+    ));
+    assert!(matches!(
+        observed_events[1],
+        AgyParsedEvent::ToolActive {
+            ref tool_name,
+            ..
+        } if tool_name == "read_file"
+    ));
+    assert!(matches!(
+        observed_events[2],
+        AgyParsedEvent::ToolDone {
+            ref tool_name,
+            ..
+        } if tool_name == "read_file"
+    ));
+
+    match outcome {
+        AgyStreamOutcome::Completed {
+            text,
+            tokens,
+            interactive_questions,
+        } => {
+            assert_eq!(text, "Streaming gateway verified.");
+            assert_eq!(tokens.input_tokens, 512);
+            assert_eq!(tokens.output_tokens, 42);
+            assert_eq!(tokens.cache_read_tokens, 128);
+            assert!(interactive_questions.is_empty());
+        }
+        other => panic!("Expected AgyStreamOutcome::Completed, got {:?}", other),
+    }
+
+    // 2. Mock script that emits stderr and exits non-zero with empty stdout
+    let err_script = tmp_dir.join("mock_agy_err.sh");
+    let err_body = "#!/bin/sh\nprintf 'Error: unknown flag -w or invalid session\\n' >&2\nexit 2\n";
+    std::fs::write(&err_script, err_body).expect("write mock_agy_err.sh");
+    let mut err_perms = std::fs::metadata(&err_script).unwrap().permissions();
+    err_perms.set_mode(0o755);
+    std::fs::set_permissions(&err_script, err_perms).unwrap();
+
+    let mut err_events = Vec::new();
+    let err_outcome = run_agy_streaming_turn(
+        err_script.to_str().unwrap(),
+        &tmp_dir,
+        "exo-suit",
+        "antigravity",
+        "gemini-4-argon",
+        None,
+        "Trigger failure",
+        &mut abort_rx,
+        |evt| err_events.push(evt),
+    )
+    .await;
+
+    assert!(err_events.is_empty());
+    match err_outcome {
+        AgyStreamOutcome::CliError(msg) => {
+            assert!(
+                msg.contains("unknown flag -w"),
+                "Expected stderr message in CliError, got: {}",
+                msg
+            );
+        }
+        other => panic!("Expected AgyStreamOutcome::CliError, got {:?}", other),
+    }
+
+    // 3. Pre-aborted receiver immediately returns AgyStreamOutcome::Aborted
+    let (pre_abort_tx, mut pre_abort_rx) = watch::channel(true);
+    let _ = pre_abort_tx;
+    let aborted_outcome = run_agy_streaming_turn(
+        ok_script.to_str().unwrap(),
+        &tmp_dir,
+        "exo-suit",
+        "antigravity",
+        "gemini-4-argon",
+        None,
+        "Should abort",
+        &mut pre_abort_rx,
+        |_| {},
+    )
+    .await;
+    assert_eq!(aborted_outcome, AgyStreamOutcome::Aborted);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

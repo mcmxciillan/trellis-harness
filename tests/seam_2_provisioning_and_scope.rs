@@ -1,9 +1,44 @@
 use exo_suit::brain::{
-    brain_dir, code_root_dir, extract_project_slug_from_text, infer_session_project_id,
-    provision_workspace_and_session_in_roots, rename_session, resolve_execution_scope,
-    save_session_project_id, validate_project_slug,
+    brain_dir, code_root_dir, extract_project_slug_from_text, get_past_sessions,
+    infer_session_project_id, provision_workspace_and_session_in_roots, rename_session,
+    resolve_execution_scope, resolve_sandboxed_workspace_path, save_session_project_id,
+    validate_project_slug,
 };
 use std::fs;
+use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct TempBrainGuard {
+    _lock: MutexGuard<'static, ()>,
+    brain_root: PathBuf,
+}
+
+impl TempBrainGuard {
+    fn new(label: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let brain_root = std::env::temp_dir().join(format!(
+            "exo_suit_seam2_{}_{}",
+            label,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&brain_root);
+        fs::create_dir_all(&brain_root).unwrap();
+        std::env::set_var("EXO_BRAIN_DIR", &brain_root);
+        Self {
+            _lock: lock,
+            brain_root,
+        }
+    }
+}
+
+impl Drop for TempBrainGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("EXO_BRAIN_DIR");
+        let _ = fs::remove_dir_all(&self.brain_root);
+    }
+}
 
 #[test]
 fn seam2_validate_project_slug_enforces_strict_sandbox_naming() {
@@ -110,13 +145,18 @@ fn seam2_provision_greenfield_project_and_existing_repo_sessions() {
 
 #[test]
 fn seam2_session_project_binding_renaming_and_execution_scope_resolution() {
+    let _guard = TempBrainGuard::new("scope");
     let test_sid = format!("test-seam2-session-{}", std::process::id());
     let s_dir = brain_dir().join(&test_sid);
     fs::create_dir_all(&s_dir).unwrap();
 
-    // Save project binding & verify inference
+    // Save project binding & verify inference + strict slug validation
     assert!(save_session_project_id(&test_sid, "exo-suit"));
     assert_eq!(infer_session_project_id(&test_sid), "exo-suit");
+    assert!(!save_session_project_id(&test_sid, "../escape"));
+    assert!(!save_session_project_id(&test_sid, ".hidden"));
+    assert!(!save_session_project_id(&test_sid, "-leading-dash"));
+    assert!(!save_session_project_id(&test_sid, "nested/slug"));
 
     // Rename session & verify persistence
     assert!(rename_session(&test_sid, "Custom Renamed Title"));
@@ -144,5 +184,36 @@ fn seam2_session_project_binding_renaming_and_execution_scope_resolution() {
     let traversal_scope = resolve_execution_scope(&test_sid, "../../../etc");
     assert_eq!(traversal_scope.project_id, "exo-suit");
 
-    let _ = fs::remove_dir_all(&s_dir);
+    // Verify resolve_sandboxed_workspace_path allows valid workspace paths and blocks traversal/symlinks
+    assert!(resolve_sandboxed_workspace_path("exo-suit", "Cargo.toml").is_some());
+    assert!(resolve_sandboxed_workspace_path("exo-suit", "src/new_uncreated_file.rs").is_some());
+    assert!(resolve_sandboxed_workspace_path("exo-suit", "../outside.txt").is_none());
+    assert!(resolve_sandboxed_workspace_path("../etc", "passwd").is_none());
+    assert!(resolve_sandboxed_workspace_path("exo-suit", "/etc/passwd").is_none());
+
+    // Verify get_past_sessions infers and caches .session_project.txt in a single pass
+    let uncached_sid = "uncached-session-1";
+    let uncached_logs = brain_dir()
+        .join(uncached_sid)
+        .join(".system_generated")
+        .join("logs");
+    fs::create_dir_all(&uncached_logs).unwrap();
+    fs::write(
+        uncached_logs.join("transcript.jsonl"),
+        format!(
+            "{{\"step_index\":1,\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"content\":\"Inspect {}/exo-suit/Cargo.toml\"}}\n",
+            code_root_dir().display()
+        ),
+    )
+    .unwrap();
+    let past = get_past_sessions(10);
+    let found = past
+        .iter()
+        .find(|s| s.session_id == uncached_sid)
+        .expect("uncached session should appear in get_past_sessions");
+    assert_eq!(found.project_id, "exo-suit");
+    assert_eq!(
+        fs::read_to_string(brain_dir().join(uncached_sid).join(".session_project.txt")).unwrap(),
+        "exo-suit"
+    );
 }

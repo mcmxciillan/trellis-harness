@@ -53,7 +53,7 @@ pub struct ToolCall {
     pub status: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InteractiveQuestionItem {
     pub index: usize,
     pub question: String,

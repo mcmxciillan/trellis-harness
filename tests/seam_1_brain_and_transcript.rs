@@ -1,10 +1,45 @@
 use exo_suit::brain::{
-    brain_dir, build_live_session_graph, classify_file_kind, clean_ansi_and_tags,
-    get_session_artifacts, get_session_chat_thread, parse_ask_question_args, read_bounded_file,
-    resolve_sandboxed_file_path, save_session_interactive_answer,
+     append_turn_to_session_transcript, atomic_write_string, brain_dir, build_live_session_graph,
+    classify_file_kind, clean_ansi_and_tags, get_session_artifacts, get_session_chat_thread,
+    parse_ask_question_args, read_bounded_file, reconcile_interactive_prompt,
+    resolve_sandboxed_file_path, save_session_agy_conversation_id,
+    save_session_interactive_answer,
 };
+use exo_suit::models::{InteractiveQuestionItem, TokenMetrics};
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs;
+use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct TempBrainGuard {
+    _lock: MutexGuard<'static, ()>,
+    root: PathBuf,
+}
+
+impl TempBrainGuard {
+    fn new(label: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "exo_suit_seam1_{}_{}",
+            label,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        std::env::set_var("EXO_BRAIN_DIR", &root);
+        Self { _lock: lock, root }
+    }
+}
+
+impl Drop for TempBrainGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("EXO_BRAIN_DIR");
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
 
 #[test]
 fn seam1_clean_ansi_and_extract_user_request_tags() {
@@ -61,6 +96,8 @@ fn seam1_parse_ask_question_args_handles_structured_and_stringified_arrays() {
 
 #[test]
 fn seam1_sandboxed_file_path_allows_workspace_and_blocks_outside_files() {
+    let guard = TempBrainGuard::new("sandbox");
+
     // Allowed: file inside ~/code/exo-suit
     let allowed = resolve_sandboxed_file_path("Cargo.toml", "", "exo-suit");
     assert!(allowed.is_some(), "Cargo.toml inside exo-suit should resolve");
@@ -71,13 +108,27 @@ fn seam1_sandboxed_file_path_allows_workspace_and_blocks_outside_files() {
     assert_eq!(bounded.file_kind, "code");
     assert!(bounded.content.contains("exo-suit"));
 
-    // Blocked: system file outside ~/code and ~/.gemini
+    // Blocked: system file outside ~/code and brain_dir
     assert!(resolve_sandboxed_file_path("/etc/passwd", "", "exo-suit").is_none());
     assert!(resolve_sandboxed_file_path("../../../../etc/hosts", "", "exo-suit").is_none());
+
+    // Blocked: symlink inside session brain directory escaping to /etc/hosts
+    let sess_dir = guard.root.join("symlink-test-session");
+    fs::create_dir_all(&sess_dir).unwrap();
+    #[cfg(unix)]
+    {
+        let link_path = sess_dir.join("escape.md");
+        std::os::unix::fs::symlink("/etc/hosts", &link_path).unwrap();
+        assert!(
+            resolve_sandboxed_file_path("escape.md", "symlink-test-session", "exo-suit").is_none(),
+            "Symlink escaping brain_dir must be rejected"
+        );
+    }
 }
 
 #[test]
 fn seam1_subagent_pruning_task_capsules_and_interactive_question_reconciliation() {
+    let _guard = TempBrainGuard::new("graph");
     let test_sid = format!("test-seam1-session-{}", std::process::id());
     let sub_active_id = format!("aaaa1111-2222-3333-4444-{:012x}", std::process::id());
     let sub_done_id = format!("bbbb1111-2222-3333-4444-{:012x}", std::process::id());
@@ -282,9 +333,93 @@ fn seam1_subagent_pruning_task_capsules_and_interactive_question_reconciliation(
         "ask-step-99",
         &["Option A".to_string()]
     ));
+}
 
-    // Cleanup test directories
-    let _ = fs::remove_dir_all(&s_dir);
-    let _ = fs::remove_dir_all(brain_dir().join(&sub_active_id));
-    let _ = fs::remove_dir_all(brain_dir().join(&sub_done_id));
+#[test]
+fn seam1_reconcile_interactive_prompt_avoids_false_positive_and_detects_real_answers() {
+    let questions = vec![InteractiveQuestionItem {
+        index: 1,
+        question: "Deploy target?".to_string(),
+        options: vec!["Staging".to_string(), "Production".to_string()],
+        is_multi_select: false,
+    }];
+    let empty_saved = HashMap::new();
+
+    // 1. Followed only by non-USER_INPUT steps (e.g. tool output or system message) -> must remain "Pending"
+    let non_answer_steps = vec![
+        json!({
+            "step_index": 11,
+            "type": "GENERIC",
+            "status": "DONE",
+            "content": "Command exited with code 0"
+        }),
+        json!({
+            "step_index": 12,
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "content": "[Message] sender=task-1 content=finished"
+        }),
+    ];
+    let pending = reconcile_interactive_prompt(10, questions.clone(), &non_answer_steps, &empty_saved);
+    assert_eq!(pending.status, "Pending");
+    assert!(pending.answers.is_empty());
+
+    // 2. Followed by a real USER_INPUT step -> marked "Answered"
+    let user_input_steps = vec![json!({
+        "step_index": 11,
+        "type": "USER_INPUT",
+        "status": "DONE",
+        "content": "<USER_REQUEST>Let's deploy to Staging first</USER_REQUEST>"
+    })];
+    let answered_by_user =
+        reconcile_interactive_prompt(10, questions.clone(), &user_input_steps, &empty_saved);
+    assert_eq!(answered_by_user.status, "Answered");
+
+    // 3. Saved answers in `.interactive_answers.json` -> marked "Answered" with saved values
+    let mut saved = HashMap::new();
+    saved.insert("ask-step-10".to_string(), vec!["Staging".to_string()]);
+    let answered_by_saved = reconcile_interactive_prompt(10, questions, &non_answer_steps, &saved);
+    assert_eq!(answered_by_saved.status, "Answered");
+    assert_eq!(answered_by_saved.answers, vec!["Staging".to_string()]);
+}
+
+#[test]
+fn seam1_atomic_write_and_transcript_append_deduplication() {
+    let guard = TempBrainGuard::new("atomic_dedup");
+
+    // 1. Verify atomic_write_string creates parent dirs, writes content, and leaves no .tmp file
+    let target_file = guard.root.join("nested").join("config.txt");
+    atomic_write_string(&target_file, "initial-value").expect("atomic write should succeed");
+    assert_eq!(fs::read_to_string(&target_file).unwrap(), "initial-value");
+    atomic_write_string(&target_file, "updated-value").expect("atomic overwrite should succeed");
+    assert_eq!(fs::read_to_string(&target_file).unwrap(), "updated-value");
+    let tmp_leftovers: Vec<_> = fs::read_dir(target_file.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+        .collect();
+    assert!(tmp_leftovers.is_empty(), "No .tmp.<pid> files should remain");
+
+    // 2. Verify append_turn_to_session_transcript deduplicates identical consecutive replies
+    let sid = "dedup-session-1";
+    let tokens = TokenMetrics {
+        input_tokens: 100,
+        cache_read_tokens: 50,
+        output_tokens: 25,
+    };
+    append_turn_to_session_transcript(sid, "Hello agent", "First reply", &[], None, &tokens);
+    append_turn_to_session_transcript(sid, "Hello agent", "  First reply  ", &[], None, &tokens);
+
+    let thread = get_session_chat_thread(sid);
+    assert_eq!(thread.len(), 2, "Duplicate turn should not be appended twice");
+
+    // 3. Verify append_turn_to_session_transcript skips when agy_conversation_id == session_id
+    save_session_agy_conversation_id(sid, sid);
+    append_turn_to_session_transcript(sid, "Second prompt", "Second reply", &[], None, &tokens);
+    let thread_after = get_session_chat_thread(sid);
+    assert_eq!(
+        thread_after.len(),
+        2,
+        "Should skip appending when agy_conversation_id equals session_id"
+    );
 }

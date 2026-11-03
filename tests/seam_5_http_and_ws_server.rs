@@ -1,7 +1,7 @@
 use exo_suit::{
     ServerContext, build_router,
     council::{ActiveRunHandle, SharedAppState},
-    dispatch_client_command, generate_snapshot_json,
+    dispatch_client_command, generate_snapshot_json, resolve_runtime_port, set_runtime_port,
 };
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc};
@@ -258,3 +258,68 @@ async fn seam5_ws_command_dispatcher_handles_open_file_git_diff_api_keys_and_can
     assert_eq!(bcast2["cancelled_runs"][0], "run-ws-99");
     assert!(*abort_rx.borrow());
 }
+
+#[tokio::test]
+async fn seam5_ws_command_dispatcher_emits_typed_error_envelopes_and_propagates_runtime_port() {
+    let ctx = make_test_context();
+    let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<String>();
+
+    // 1. Malformed JSON -> COMMAND_ERROR with command == "PARSE_ERROR"
+    dispatch_client_command("{not valid json", &ctx, &direct_tx).await;
+    let err_parse: Value = serde_json::from_str(&direct_rx.recv().await.unwrap()).unwrap();
+    assert_eq!(err_parse["type"], "COMMAND_ERROR");
+    assert_eq!(err_parse["command"], "PARSE_ERROR");
+    assert!(
+        err_parse["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Invalid JSON command payload")
+    );
+
+    // 2. Unknown command -> COMMAND_ERROR with command == "NON_EXISTENT_CMD"
+    dispatch_client_command(
+        &json!({
+            "command": "NON_EXISTENT_CMD"
+        })
+        .to_string(),
+        &ctx,
+        &direct_tx,
+    )
+    .await;
+    let err_unknown: Value = serde_json::from_str(&direct_rx.recv().await.unwrap()).unwrap();
+    assert_eq!(err_unknown["type"], "COMMAND_ERROR");
+    assert_eq!(err_unknown["command"], "NON_EXISTENT_CMD");
+    assert!(
+        err_unknown["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("NON_EXISTENT_CMD")
+    );
+
+    // 3. OPEN_FILE outside sandbox -> COMMAND_ERROR with command == "OPEN_FILE"
+    dispatch_client_command(
+        &json!({
+            "command": "OPEN_FILE",
+            "path": "/etc/passwd"
+        })
+        .to_string(),
+        &ctx,
+        &direct_tx,
+    )
+    .await;
+    let err_file: Value = serde_json::from_str(&direct_rx.recv().await.unwrap()).unwrap();
+    assert_eq!(err_file["type"], "COMMAND_ERROR");
+    assert_eq!(err_file["command"], "OPEN_FILE");
+    assert_eq!(err_file["path"], "/etc/passwd");
+    assert_eq!(
+        err_file["error"],
+        "File not found or outside workspace sandbox"
+    );
+
+    // 4. Dynamic runtime port propagation
+    set_runtime_port(9456);
+    assert_eq!(resolve_runtime_port(), 9456);
+    set_runtime_port(9000);
+    assert_eq!(resolve_runtime_port(), 9000);
+}
+

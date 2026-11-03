@@ -1,41 +1,570 @@
 use crate::brain::{clean_ansi_and_tags, home_dir, parse_ask_question_args, sanitize_code_path};
 use crate::models::{
-    DecisionEvaluation, DecisionPrimitive, InteractiveQuestionItem, ProviderInfo,
+    DecisionEvaluation, DecisionPrimitive, InteractiveQuestionItem, ProviderInfo, TokenMetrics,
 };
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
+static BIN_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+
 pub fn detect_binary(candidates: &[&str]) -> Option<String> {
+    let cache_mutex = BIN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let local_bin = home_dir().join(".local").join("bin");
+
     for &c in candidates {
-        if Path::new(c).exists() {
-            return Some(c.to_string());
-        }
-        let user_local = local_bin.join(c);
-        if user_local.exists() {
-            return Some(user_local.to_string_lossy().to_string());
-        }
-        if let Ok(output) = std::process::Command::new("which").arg(c).output() {
-            if output.status.success() {
-                let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !p.is_empty() {
-                    return Some(p);
+        if let Ok(guard) = cache_mutex.lock() {
+            if let Some(cached) = guard.get(c) {
+                if let Some(found) = cached {
+                    return Some(found.clone());
+                } else {
+                    continue;
                 }
             }
+        }
+
+        let resolved = if Path::new(c).exists() {
+            Some(c.to_string())
+        } else {
+            let user_local = local_bin.join(c);
+            if user_local.exists() {
+                Some(user_local.to_string_lossy().to_string())
+            } else if let Ok(output) = std::process::Command::new("which").arg(c).output() {
+                if output.status.success() {
+                    let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !p.is_empty() {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Ok(mut guard) = cache_mutex.lock() {
+            guard.insert(c.to_string(), resolved.clone());
+        }
+
+        if let Some(found) = resolved {
+            return Some(found);
         }
     }
     None
 }
 
+pub fn resolve_api_model_name(provider_id: &str, requested_model: &str) -> String {
+    let trimmed = requested_model.trim();
+    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("default") {
+        return trimmed.to_string();
+    }
+    match provider_id {
+        "antigravity" => "gemini-4-argon".to_string(),
+        "jev" => "jev-latest".to_string(),
+        "claude" => "claude-4-sonnet".to_string(),
+        "codex" => "codex-mini-latest".to_string(),
+        "copilot" => "copilot-gpt-4o".to_string(),
+        "deepseek" => "deepseek-chat".to_string(),
+        "kimi" => "kimi-k2-5".to_string(),
+        _ => "gpt-4o".to_string(),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum AgyStreamOutcome {
+    Completed {
+        text: String,
+        tokens: TokenMetrics,
+        interactive_questions: Vec<InteractiveQuestionItem>,
+    },
+    Aborted,
+    CliError(String),
+}
+
+impl PartialEq for AgyStreamOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Completed {
+                    text: t1,
+                    tokens: tk1,
+                    interactive_questions: iq1,
+                },
+                Self::Completed {
+                    text: t2,
+                    tokens: tk2,
+                    interactive_questions: iq2,
+                },
+            ) => {
+                t1 == t2
+                    && tk1.input_tokens == tk2.input_tokens
+                    && tk1.cache_read_tokens == tk2.cache_read_tokens
+                    && tk1.output_tokens == tk2.output_tokens
+                    && iq1 == iq2
+            }
+            (Self::Aborted, Self::Aborted) => true,
+            (Self::CliError(e1), Self::CliError(e2)) => e1 == e2,
+            _ => false,
+        }
+    }
+}
+
+pub async fn run_agy_streaming_turn<F>(
+    agy_bin: &str,
+    workspace_path: &std::path::Path,
+    project_id: &str,
+    provider_id: &str,
+    model: &str,
+    conversation_id: Option<&str>,
+    prompt: &str,
+    abort_rx: &mut tokio::sync::watch::Receiver<bool>,
+    mut on_event: F,
+) -> AgyStreamOutcome
+where
+    F: FnMut(AgyParsedEvent),
+{
+    if *abort_rx.borrow() {
+        return AgyStreamOutcome::Aborted;
+    }
+
+    let mapped_model = map_provider_to_agy_model(provider_id, model);
+    let contextualized_prompt = if prompt.starts_with("[Workspace:") {
+        prompt.to_string()
+    } else {
+        format!(
+            "[Workspace: {} ({})]\n\n{}",
+            project_id,
+            workspace_path.display(),
+            prompt
+        )
+    };
+
+    let mut cmd = Command::new(agy_bin);
+    cmd.current_dir(workspace_path);
+    if let Some(conv_id) = conversation_id {
+        if !conv_id.trim().is_empty() {
+            cmd.arg("--conversation").arg(conv_id);
+        }
+    }
+    cmd.arg("--model")
+        .arg(&mapped_model)
+        .arg("-p")
+        .arg(&contextualized_prompt)
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--print-timeout")
+        .arg("300s")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return AgyStreamOutcome::CliError(format!(
+                "Failed to spawn agy CLI ({}): {}",
+                agy_bin, e
+            ));
+        }
+    };
+
+    let mut streamed_text = String::new();
+    let mut interactive_questions = Vec::new();
+    let mut final_tokens = TokenMetrics {
+        input_tokens: (prompt.len() as u64 / 3) + 320,
+        cache_read_tokens: 900,
+        output_tokens: 0,
+    };
+
+    let stderr = child.stderr.take();
+    if let Some(stdout) = child.stdout.take() {
+        let mut lines = BufReader::new(stdout).lines();
+        loop {
+            let line_res = tokio::select! {
+                l = lines.next_line() => l,
+                _ = abort_rx.changed() => {
+                    if *abort_rx.borrow() {
+                        let _ = child.kill().await;
+                        return AgyStreamOutcome::Aborted;
+                    }
+                    continue;
+                }
+            };
+
+            let Some(line) = (match line_res {
+                Ok(Some(l)) => Some(l),
+                _ => None,
+            }) else {
+                break;
+            };
+
+            let Some(evt) = parse_agy_stream_json_line(&line, project_id) else {
+                continue;
+            };
+
+            on_event(evt.clone());
+
+            if *abort_rx.borrow() {
+                let _ = child.kill().await;
+                return AgyStreamOutcome::Aborted;
+            }
+
+            match evt {
+                AgyParsedEvent::Init { .. } => {}
+                AgyParsedEvent::ToolActive { questions, .. } => {
+                    if !questions.is_empty() {
+                        interactive_questions = questions;
+                    }
+                }
+                AgyParsedEvent::ToolDone { .. } => {}
+                AgyParsedEvent::TextDelta {
+                    delta,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    ..
+                } => {
+                    streamed_text.push_str(&delta);
+                    if let Some(it) = input_tokens {
+                        if it > 0 {
+                            final_tokens.input_tokens = it;
+                        }
+                    }
+                    if let Some(ot) = output_tokens {
+                        if ot > 0 {
+                            final_tokens.output_tokens = ot;
+                        }
+                    }
+                    if let Some(crt) = cache_read_tokens {
+                        if crt > 0 {
+                            final_tokens.cache_read_tokens = crt;
+                        }
+                    }
+                }
+                AgyParsedEvent::Result {
+                    response,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    ..
+                } => {
+                    if streamed_text.trim().is_empty() && !response.trim().is_empty() {
+                        streamed_text = response;
+                    }
+                    if input_tokens > 0 {
+                        final_tokens.input_tokens = input_tokens;
+                    }
+                    if output_tokens > 0 {
+                        final_tokens.output_tokens = output_tokens;
+                    }
+                    if cache_read_tokens > 0 {
+                        final_tokens.cache_read_tokens = cache_read_tokens;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    drop(on_event);
+
+    if *abort_rx.borrow() {
+        let _ = child.kill().await;
+        return AgyStreamOutcome::Aborted;
+    }
+
+    if !streamed_text.trim().is_empty() || !interactive_questions.is_empty() {
+        let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+        let _ = child.start_kill();
+        if final_tokens.output_tokens == 0 {
+            final_tokens.output_tokens = (streamed_text.len() as u64 / 3).max(48);
+        }
+        return AgyStreamOutcome::Completed {
+            text: streamed_text,
+            tokens: final_tokens,
+            interactive_questions,
+        };
+    }
+
+    let mut stderr_buf = String::new();
+    if let Some(mut se) = stderr {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(400),
+            se.read_to_string(&mut stderr_buf),
+        )
+        .await;
+    }
+    let status = tokio::time::timeout(Duration::from_millis(400), child.wait())
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+    let _ = child.start_kill();
+
+    let stderr_msg = clean_ansi_and_tags(&stderr_buf).trim().to_string();
+    if !stderr_msg.is_empty() {
+        AgyStreamOutcome::CliError(stderr_msg)
+    } else {
+        let code_str = status
+            .and_then(|s| s.code())
+            .map(|c| format!("exit code {}", c))
+            .unwrap_or_else(|| "empty output".to_string());
+        AgyStreamOutcome::CliError(format!("agy CLI exited with {}", code_str))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgyParsedEvent {
+    Init {
+        conversation_id: String,
+    },
+    ToolActive {
+        step_index: u32,
+        tool_name: String,
+        summary: String,
+        questions: Vec<InteractiveQuestionItem>,
+    },
+    ToolDone {
+        step_index: u32,
+        tool_name: String,
+    },
+    TextDelta {
+        step_index: u32,
+        delta: String,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+    },
+    Result {
+        conversation_id: String,
+        response: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+    },
+}
+
+pub fn map_provider_to_agy_model(provider_id: &str, model: &str) -> String {
+    let m = model.trim().to_lowercase();
+    match provider_id {
+        "claude" => {
+            if m.contains("opus") {
+                if m.contains("low") {
+                    "claude-opus-5-5-low".to_string()
+                } else if m.contains("medium") {
+                    "claude-opus-5-5-medium".to_string()
+                } else {
+                    "claude-opus-5-5-high".to_string()
+                }
+            } else if m.contains("low") {
+                "claude-sonnet-5-5-low".to_string()
+            } else if m.contains("high") {
+                "claude-sonnet-5-5-high".to_string()
+            } else {
+                "claude-sonnet-5-5-medium".to_string()
+            }
+        }
+        "codex" | "copilot" => "gpt-oss-120b-medium".to_string(),
+        _ => {
+            if m.contains("flash") {
+                if m.contains("low") {
+                    "gemini-3.8-flash-low".to_string()
+                } else if m.contains("medium") {
+                    "gemini-3.8-flash-medium".to_string()
+                } else {
+                    "gemini-3.8-flash-high".to_string()
+                }
+            } else if m.contains("high") || m.contains("pro") {
+                "gemini-4-argon-high".to_string()
+            } else if m.contains("low") {
+                "gemini-4-argon-low".to_string()
+            } else {
+                "gemini-4-argon-medium".to_string()
+            }
+        }
+    }
+}
+
+pub fn parse_agy_stream_json_line(line: &str, active_project: &str) -> Option<AgyParsedEvent> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let val: Value = serde_json::from_str(trimmed).ok()?;
+    let ev_type = val.get("event")?.as_str()?;
+
+    match ev_type {
+        "init" => {
+            let cid = val
+                .get("conversation_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if cid.is_empty() {
+                None
+            } else {
+                Some(AgyParsedEvent::Init {
+                    conversation_id: cid,
+                })
+            }
+        }
+        "step_update" => {
+            let su = val.get("step_update")?;
+            let step_index = su.get("step_index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let state = su.get("state").and_then(|v| v.as_str()).unwrap_or("");
+            let step_type = su.get("step_type").and_then(|v| v.as_str()).unwrap_or("");
+
+            if step_type == "tool" {
+                let raw_tool_name = su
+                    .get("tool_name")
+                    .or_else(|| su.get("tool_info").and_then(|ti| ti.get("name")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool");
+                // Normalize internal CLI tool names to standard Trellis UI badges
+                let tool_name = match raw_tool_name {
+                    "view_file" => "read_file".to_string(),
+                    "replace_file_content" | "multi_replace_file_content" => {
+                        "edit_file".to_string()
+                    }
+                    "write_to_file" => "write_file".to_string(),
+                    other => other.to_string(),
+                };
+
+                if state == "ACTIVE" {
+                    let params = su.get("tool_info").and_then(|ti| ti.get("parameters"));
+                    let mut questions = Vec::new();
+                    if tool_name == "ask_question" {
+                        questions = parse_ask_question_args(params);
+                    }
+                    let raw_summary = if tool_name == "ask_question" && !questions.is_empty() {
+                        questions[0].question.clone()
+                    } else {
+                        params
+                            .and_then(|p| {
+                                p.get("toolSummary")
+                                    .or_else(|| p.get("Path"))
+                                    .or_else(|| p.get("TargetFile"))
+                                    .or_else(|| p.get("CommandLine"))
+                                    .or_else(|| p.get("Query"))
+                                    .or_else(|| p.get("query"))
+                                    .or_else(|| p.get("SearchPath"))
+                                    .or_else(|| p.get("DirectoryPath"))
+                                    .or_else(|| p.get("Role"))
+                            })
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim_matches('"').to_string())
+                            .unwrap_or_else(|| format!("~/code/{}", active_project))
+                    };
+                    let code_prefix = format!("{}/code/", home_dir().to_string_lossy());
+                    let proj_prefix = format!("{}{}/", code_prefix, active_project);
+                    let summary = raw_summary
+                        .replace(&proj_prefix, "")
+                        .replace(&code_prefix, "")
+                        .chars()
+                        .take(80)
+                        .collect();
+
+                    Some(AgyParsedEvent::ToolActive {
+                        step_index,
+                        tool_name,
+                        summary,
+                        questions,
+                    })
+                } else if state == "DONE" {
+                    Some(AgyParsedEvent::ToolDone {
+                        step_index,
+                        tool_name,
+                    })
+                } else {
+                    None
+                }
+            } else if step_type == "agent_response" {
+                let delta = su
+                    .get("text_delta")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let usage = su.get("usage");
+                let input_tokens = usage
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(|v| v.as_u64());
+                let output_tokens = usage
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(|v| v.as_u64());
+                let cache_read_tokens = usage
+                    .and_then(|u| u.get("cache_read_tokens"))
+                    .and_then(|v| v.as_u64());
+
+                if !delta.is_empty() || input_tokens.is_some() {
+                    Some(AgyParsedEvent::TextDelta {
+                        step_index,
+                        delta,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        "result" => {
+            let res = val.get("result").unwrap_or(&val);
+            let cid = res
+                .get("conversation_id")
+                .or_else(|| val.get("conversation_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let response = res
+                .get("response")
+                .or_else(|| val.get("response"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let usage = res
+                .get("usage")
+                .or_else(|| res.get("stats"))
+                .or_else(|| val.get("stats"));
+            let input_tokens = usage
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let output_tokens = usage
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cache_read_tokens = usage
+                .and_then(|u| u.get("cache_read_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            Some(AgyParsedEvent::Result {
+                conversation_id: cid,
+                response,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<ProviderInfo> {
     let agy_bin = detect_binary(&["agy"]);
-    let claude_bin = detect_binary(&["/opt/homebrew/bin/claude", "claude"]);
-    let codex_bin = detect_binary(&["/opt/homebrew/bin/codex", "codex"]);
+    let claude_bin = detect_binary(&["/opt/homebrew/bin/claude", "claude"]).or_else(|| agy_bin.clone());
+    let codex_bin = detect_binary(&["/opt/homebrew/bin/codex", "codex"]).or_else(|| agy_bin.clone());
     let gh_bin = detect_binary(&["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "gh"]);
 
     let has_key = |env_names: &[&str], id: &str| -> bool {
@@ -583,35 +1112,21 @@ pub async fn execute_provider_prompt(
         .build()
         .unwrap_or_default();
 
+    let api_model = resolve_api_model_name(provider_id, model);
+
     match provider_id {
         "claude" => {
             if let Some(key) = resolve_key(api_keys, "claude", &["ANTHROPIC_API_KEY"]) {
-                let api_model = if model.starts_with("claude-") {
-                    "claude-3-7-sonnet-latest"
-                } else {
-                    model
-                };
-                if let Ok(resp) = client
-                    .post("https://api.anthropic.com/v1/messages")
-                    .header("x-api-key", key)
-                    .header("anthropic-version", "2023-06-01")
-                    .json(&json!({
-                        "model": api_model,
-                        "max_tokens": 1024,
-                        "messages": [{"role": "user", "content": contextualized_prompt}]
-                    }))
-                    .send()
+                if !key.is_empty() {
+                    match call_anthropic_messages(
+                        &client,
+                        &key,
+                        &api_model,
+                        &contextualized_prompt,
+                    )
                     .await
-                {
-                    if let Ok(val) = resp.json::<Value>().await {
-                        if let Some(text) = val
-                            .get("content")
-                            .and_then(|c| c.as_array())
-                            .and_then(|a| a.first())
-                            .and_then(|item| item.get("text"))
-                            .and_then(|t| t.as_str())
-                        {
-                            let clean = text.trim().to_string();
+                    {
+                        Ok(clean) => {
                             let iqs = maybe_extract_or_synthesize_questions(
                                 prompt,
                                 &clean,
@@ -626,137 +1141,217 @@ pub async fn execute_provider_prompt(
                                 interactive_questions: iqs,
                             };
                         }
+                        Err(diag) => {
+                            return ProviderResponse {
+                                text: format!(
+                                    "⚠️ [CLAUDE • {}] Live API Error: {}",
+                                    api_model, diag
+                                ),
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API_ERROR".to_string(),
+                                decision_eval: None,
+                                interactive_questions: Vec::new(),
+                            };
+                        }
                     }
                 }
             }
         }
         "codex" => {
             if let Some(key) = resolve_key(api_keys, "codex", &["OPENAI_API_KEY"]) {
-                if let Some(text) = call_openai_compatible(
-                    &client,
-                    "https://api.openai.com/v1/chat/completions",
-                    &key,
-                    "gpt-4o",
-                    &contextualized_prompt,
-                )
-                .await
-                {
-                    let iqs = maybe_extract_or_synthesize_questions(
-                        prompt,
-                        &text,
-                        active_project,
-                        fast_council_stage,
-                    );
-                    return ProviderResponse {
-                        text,
-                        latency_ms: start.elapsed().as_millis() as u64,
-                        execution_mode: "LIVE_API".to_string(),
-                        decision_eval: None,
-                        interactive_questions: iqs,
-                    };
+                if !key.is_empty() {
+                    match call_openai_compatible(
+                        &client,
+                        "https://api.openai.com/v1/chat/completions",
+                        &key,
+                        &api_model,
+                        &contextualized_prompt,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let iqs = maybe_extract_or_synthesize_questions(
+                                prompt,
+                                &text,
+                                active_project,
+                                fast_council_stage,
+                            );
+                            return ProviderResponse {
+                                text,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API".to_string(),
+                                decision_eval: None,
+                                interactive_questions: iqs,
+                            };
+                        }
+                        Err(diag) => {
+                            return ProviderResponse {
+                                text: format!(
+                                    "⚠️ [CODEX • {}] Live API Error: {}",
+                                    api_model, diag
+                                ),
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API_ERROR".to_string(),
+                                decision_eval: None,
+                                interactive_questions: Vec::new(),
+                            };
+                        }
+                    }
                 }
             }
         }
         "deepseek" => {
             if let Some(key) = resolve_key(api_keys, "deepseek", &["DEEPSEEK_API_KEY"]) {
-                let ds_model = if model.is_empty() { "deepseek-chat" } else { model };
-                if let Some(text) = call_openai_compatible(
-                    &client,
-                    "https://api.deepseek.com/chat/completions",
-                    &key,
-                    ds_model,
-                    &contextualized_prompt,
-                )
-                .await
-                {
-                    let iqs = maybe_extract_or_synthesize_questions(
-                        prompt,
-                        &text,
-                        active_project,
-                        fast_council_stage,
-                    );
-                    return ProviderResponse {
-                        text,
-                        latency_ms: start.elapsed().as_millis() as u64,
-                        execution_mode: "LIVE_API".to_string(),
-                        decision_eval: None,
-                        interactive_questions: iqs,
-                    };
+                if !key.is_empty() {
+                    match call_openai_compatible(
+                        &client,
+                        "https://api.deepseek.com/chat/completions",
+                        &key,
+                        &api_model,
+                        &contextualized_prompt,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let iqs = maybe_extract_or_synthesize_questions(
+                                prompt,
+                                &text,
+                                active_project,
+                                fast_council_stage,
+                            );
+                            return ProviderResponse {
+                                text,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API".to_string(),
+                                decision_eval: None,
+                                interactive_questions: iqs,
+                            };
+                        }
+                        Err(diag) => {
+                            return ProviderResponse {
+                                text: format!(
+                                    "⚠️ [DEEPSEEK • {}] Live API Error: {}",
+                                    api_model, diag
+                                ),
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API_ERROR".to_string(),
+                                decision_eval: None,
+                                interactive_questions: Vec::new(),
+                            };
+                        }
+                    }
                 }
             }
         }
         "kimi" => {
             if let Some(key) = resolve_key(api_keys, "kimi", &["MOONSHOT_API_KEY", "KIMI_API_KEY"])
             {
-                if let Some(text) = call_openai_compatible(
-                    &client,
-                    "https://api.moonshot.cn/v1/chat/completions",
-                    &key,
-                    "moonshot-v1-8k",
-                    &contextualized_prompt,
-                )
-                .await
-                {
-                    let iqs = maybe_extract_or_synthesize_questions(
-                        prompt,
-                        &text,
-                        active_project,
-                        fast_council_stage,
-                    );
-                    return ProviderResponse {
-                        text,
-                        latency_ms: start.elapsed().as_millis() as u64,
-                        execution_mode: "LIVE_API".to_string(),
-                        decision_eval: None,
-                        interactive_questions: iqs,
-                    };
+                if !key.is_empty() {
+                    match call_openai_compatible(
+                        &client,
+                        "https://api.moonshot.cn/v1/chat/completions",
+                        &key,
+                        &api_model,
+                        &contextualized_prompt,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let iqs = maybe_extract_or_synthesize_questions(
+                                prompt,
+                                &text,
+                                active_project,
+                                fast_council_stage,
+                            );
+                            return ProviderResponse {
+                                text,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API".to_string(),
+                                decision_eval: None,
+                                interactive_questions: iqs,
+                            };
+                        }
+                        Err(diag) => {
+                            return ProviderResponse {
+                                text: format!(
+                                    "⚠️ [KIMI • {}] Live API Error: {}",
+                                    api_model, diag
+                                ),
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API_ERROR".to_string(),
+                                decision_eval: None,
+                                interactive_questions: Vec::new(),
+                            };
+                        }
+                    }
                 }
             }
         }
         "copilot" => {
             if let Some(key) = resolve_key(api_keys, "copilot", &["GITHUB_TOKEN", "GH_TOKEN"]) {
-                if let Some(text) = call_openai_compatible(
-                    &client,
-                    "https://models.inference.ai.azure.com/chat/completions",
-                    &key,
-                    "gpt-4o",
-                    &contextualized_prompt,
-                )
-                .await
-                {
-                    let iqs = maybe_extract_or_synthesize_questions(
-                        prompt,
-                        &text,
-                        active_project,
-                        fast_council_stage,
-                    );
-                    return ProviderResponse {
-                        text,
-                        latency_ms: start.elapsed().as_millis() as u64,
-                        execution_mode: "LIVE_API".to_string(),
-                        decision_eval: None,
-                        interactive_questions: iqs,
-                    };
+                if !key.is_empty() {
+                    match call_openai_compatible(
+                        &client,
+                        "https://models.inference.ai.azure.com/chat/completions",
+                        &key,
+                        &api_model,
+                        &contextualized_prompt,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let iqs = maybe_extract_or_synthesize_questions(
+                                prompt,
+                                &text,
+                                active_project,
+                                fast_council_stage,
+                            );
+                            return ProviderResponse {
+                                text,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API".to_string(),
+                                decision_eval: None,
+                                interactive_questions: iqs,
+                            };
+                        }
+                        Err(diag) => {
+                            return ProviderResponse {
+                                text: format!(
+                                    "⚠️ [COPILOT • {}] Live API Error: {}",
+                                    api_model, diag
+                                ),
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API_ERROR".to_string(),
+                                decision_eval: None,
+                                interactive_questions: Vec::new(),
+                            };
+                        }
+                    }
                 }
             }
         }
         _ => {}
     }
 
-    if provider_id == "antigravity" && !fast_council_stage {
+    if !fast_council_stage
+        && (provider_id == "antigravity" || provider_id == "claude" || provider_id == "codex")
+    {
         if let Some(agy_bin) = detect_binary(&["agy"]) {
+            let agy_model = map_provider_to_agy_model(provider_id, model);
             let mut cmd = Command::new(&agy_bin);
             cmd.arg("-p")
                 .arg(&contextualized_prompt)
+                .arg("--model")
+                .arg(&agy_model)
                 .arg("--print-timeout")
-                .arg("15s")
+                .arg("180s")
                 .current_dir(&work_dir)
                 .kill_on_drop(true)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             let fut = cmd.output();
 
-            if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(16), fut).await {
+            if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(185), fut).await {
                 let stdout = clean_ansi_and_tags(&String::from_utf8_lossy(&output.stdout));
                 if !stdout.is_empty() && output.status.success() {
                     let iqs = maybe_extract_or_synthesize_questions(
@@ -789,7 +1384,7 @@ pub async fn execute_provider_prompt(
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
     let text =
-        synthesize_provider_perspective(provider_id, model, prompt, active_project, &sample_files);
+        synthesize_provider_perspective(provider_id, &api_model, prompt, active_project, &sample_files);
     let iqs =
         maybe_extract_or_synthesize_questions(prompt, &text, active_project, fast_council_stage);
 
@@ -806,13 +1401,72 @@ pub async fn execute_provider_prompt(
     }
 }
 
+async fn call_anthropic_messages(
+    client: &Client,
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    let url = "https://api.anthropic.com/v1/messages";
+    let resp = client
+        .post(url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": model,
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}]
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Upstream HTTP request failed ({}): {}", url, e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let err_body = resp.text().await.unwrap_or_default();
+        let snippet: String = err_body.chars().take(240).collect();
+        return Err(format!(
+            "Upstream HTTP {} from {} (model `{}`): {}",
+            status.as_u16(),
+            url,
+            model,
+            if snippet.trim().is_empty() {
+                status.canonical_reason().unwrap_or("HTTP error")
+            } else {
+                snippet.trim()
+            }
+        ));
+    }
+
+    let val: Value = resp.json().await.map_err(|e| {
+        format!(
+            "Failed to parse JSON response from {} (model `{}`): {}",
+            url, model, e
+        )
+    })?;
+
+    val.get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Upstream response from {} (model `{}`) missing content[0].text",
+                url, model
+            )
+        })
+}
+
 async fn call_openai_compatible(
     client: &Client,
     url: &str,
     api_key: &str,
     model: &str,
     prompt: &str,
-) -> Option<String> {
+) -> Result<String, String> {
     let resp = client
         .post(url)
         .bearer_auth(api_key)
@@ -824,9 +1478,32 @@ async fn call_openai_compatible(
         }))
         .send()
         .await
-        .ok()?;
+        .map_err(|e| format!("Upstream HTTP request failed ({}): {}", url, e))?;
 
-    let val: Value = resp.json().await.ok()?;
+    let status = resp.status();
+    if !status.is_success() {
+        let err_body = resp.text().await.unwrap_or_default();
+        let snippet: String = err_body.chars().take(240).collect();
+        return Err(format!(
+            "Upstream HTTP {} from {} (model `{}`): {}",
+            status.as_u16(),
+            url,
+            model,
+            if snippet.trim().is_empty() {
+                status.canonical_reason().unwrap_or("HTTP error")
+            } else {
+                snippet.trim()
+            }
+        ));
+    }
+
+    let val: Value = resp.json().await.map_err(|e| {
+        format!(
+            "Failed to parse JSON response from {} (model `{}`): {}",
+            url, model, e
+        )
+    })?;
+
     val.get("choices")
         .and_then(|c| c.as_array())
         .and_then(|a| a.first())
@@ -834,6 +1511,13 @@ async fn call_openai_compatible(
         .and_then(|m| m.get("content"))
         .and_then(|t| t.as_str())
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Upstream response from {} (model `{}`) missing choices[0].message.content",
+                url, model
+            )
+        })
 }
 
 fn collect_project_files_preview(work_dir: &Path) -> Vec<String> {
