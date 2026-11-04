@@ -727,6 +727,12 @@ pub fn get_installed_skills() -> Vec<SkillItem> {
     let mut skills = Vec::new();
     let mut seen = HashSet::new();
 
+    scan_skills_dir(
+        &home.join("code").join("code-gardening").join("skills"),
+        "code-gardening",
+        &mut skills,
+        &mut seen,
+    );
     scan_skills_dir(&gemini.join("skills"), "user-skills", &mut skills, &mut seen);
     scan_skills_dir(&gemini.join("config").join("skills"), "config-skills", &mut skills, &mut seen);
     scan_skills_dir(

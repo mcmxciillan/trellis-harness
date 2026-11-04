@@ -3942,6 +3942,20 @@
         `/deforestation Audit ~/code/${state.activeProject} for architectural smells and modernize shallow modules into deep modules.`,
     },
     {
+      cmd: "/bonsai",
+      stage: "🪴 Bonsai",
+      desc: "Surgical code pruning, 12->3 line compression & 1MB->10KB dependency diet",
+      buildPrompt: () =>
+        `/bonsai Audit ~/code/${state.activeProject} using the 5 Pruning Shears to compress ceremony, eliminate dead code, and prune heavy dependencies.`,
+    },
+    {
+      cmd: "/seed-catalog",
+      stage: "📖 Catalog",
+      desc: "Ubiquitous language (GLOSSARY.md), semantic rename proposals & verified core docs",
+      buildPrompt: () =>
+        `/seed-catalog Extract the canonical domain & 5-Tier seam vocabulary into GLOSSARY.md, propose semantic renames, and verify core documentation for ~/code/${state.activeProject}.`,
+    },
+    {
       cmd: "/prod",
       stage: "🚀 Deploy",
       desc: "Production release compilation, adversarial review & Change Ticket dashboard",
