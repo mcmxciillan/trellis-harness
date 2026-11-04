@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/rust-2024_edition-A8202A?style=flat-square&logo=rust" alt="Rust Edition" />
+  <img src="https://img.shields.io/badge/rust-2021_edition-A8202A?style=flat-square&logo=rust" alt="Rust Edition" />
   <img src="https://img.shields.io/badge/binary-single_executable-2D4A3E?style=flat-square" alt="Single Binary" />
   <img src="https://img.shields.io/badge/agents-23_coding_agents_&_APIs-0064E0?style=flat-square" alt="23 Coding Agents & APIs" />
   <img src="https://img.shields.io/badge/tests-43_passed_(5_seams)-2D4A3E?style=flat-square" alt="43 Tests Passing" />
@@ -62,7 +62,7 @@ Where raw autonomous agents can become opaque or unruly across multiple reposito
 - **Hard Execution Cancellation (`⏹ Stop`):** Every CLI subprocess and HTTP provider stream is wired to a `tokio::sync::watch` abort channel and `.kill_on_drop(true)` process guard, enabling instant mid-flight termination from the UI.
 
 ### 3. Topbar Session & Greenfield Project Provisioner (`+ New`)
-- **Existing Workspace Sessions:** Spin up a clean, isolated session bound to any existing `~/code/<repo>` directory in one click.
+- **Existing Workspace Project Sessions:** Spin up a clean, isolated session bound to any existing `~/code/<repo>` directory in one click.
 - **Greenfield Project Scaffolding:** Provision a brand-new repository under `~/code/<slug>` with strict slug validation, automatic `git init -b main`, initial `README.md` scaffolding, and an optional Day-1 `/greenfield-architecture` kickoff prompt.
 
 ### 4. Developer Lifecycle Cockpit
@@ -185,7 +185,7 @@ The topbar DevOps strip (`#topbar-devops-strip`) and collapsible Cockpit drawer 
 
 ### Prerequisites
 
-- **Rust Toolchain:** Rust `1.85+` (2024 Edition) via [`rustup`](https://rustup.rs/)
+- **Rust Toolchain:** Rust `1.85+` (2021 Edition) via [`rustup`](https://rustup.rs/)
 - **Git:** Standard `git` CLI for workspace status, diff inspection, and greenfield repository initialization
 
 ### Clone, Build & Run Release Binary

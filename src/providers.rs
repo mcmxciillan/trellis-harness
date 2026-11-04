@@ -139,7 +139,8 @@ async fn run_cli_streaming_process<F>(
 where
     F: FnMut(AgyParsedEvent),
 {
-    cmd.stdout(Stdio::piped())
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 

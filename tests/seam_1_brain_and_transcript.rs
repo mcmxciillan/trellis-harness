@@ -111,6 +111,9 @@ fn seam1_sandboxed_file_path_allows_workspace_and_blocks_outside_files() {
     // Blocked: system file outside ~/code and brain_dir
     assert!(resolve_sandboxed_file_path("/etc/passwd", "", "exo-suit").is_none());
     assert!(resolve_sandboxed_file_path("../../../../etc/hosts", "", "exo-suit").is_none());
+    assert!(exo_suit::brain::get_session_artifacts("../escape").is_empty());
+    assert!(!exo_suit::brain::approve_artifact_metadata("../escape", "plan.md"));
+    assert!(!exo_suit::brain::approve_artifact_metadata("valid-session", "../escape"));
 
     // Blocked: symlink inside session brain directory escaping to /etc/hosts
     let sess_dir = guard.root.join("symlink-test-session");
