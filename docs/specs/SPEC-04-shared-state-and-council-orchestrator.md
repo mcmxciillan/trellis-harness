@@ -51,7 +51,7 @@ impl SharedAppState {
 }
 ```
 - **Encapsulated Invariants**:
-  1. **Single Atomic Chat Mutation Seam**: `SharedAppState::update_scoped_chat_message` updates `session_custom_messages[session_id]` and, if `self.active_session_id == session_id`, synchronizes `custom_chat_messages` and `chat_thread` in one place—eliminating all 8 duplicate loops.
+  1. **Single Atomic Chat Mutation Seam**: `SharedAppState::update_scoped_chat_message` updates `session_custom_messages[session_id]` and, if `self.active_session_id == session_id`, synchronizes `active_session_live_messages` and `chat_thread` in one place—eliminating all 8 duplicate loops.
   2. **Strict Session Isolation for Graph & Council**: `st.agents` mutations during `run_independent_prompt` and `run_council_session` are guarded by `if scope.session_id == st.active_session_id`. All outbound `CHAT_STREAM_UPDATE`, `AGENT_SPAWNED`, and `AGENTS_UPDATED` packets include `"session_id": scope.session_id`.
   3. **Gateway Delegation**: `run_independent_prompt` delegates `agy` CLI execution to `crate::providers::run_agy_streaming_turn`, shrinking `run_independent_prompt` by over 250 lines.
   4. **Monotonic Run Identifiers & Configurable Port**: `next_monotonic_run_id(prefix)` combines timestamp + `AtomicU64` counter for collision-free IDs, and `SharedAppState` stores `pub server_port: u16` (defaulting to `9000`).

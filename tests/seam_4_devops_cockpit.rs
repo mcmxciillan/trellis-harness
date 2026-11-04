@@ -272,7 +272,7 @@ fn seam4_compute_workspace_diff_synthesizes_untracked_file_and_builds_snapshot()
     assert!(!devops.deploy_health.endpoints.is_empty());
     assert_eq!(devops.deploy_health.endpoints[0].status_code, 200);
 
-    // Verify 15-second TTL deploy health cache returns cached DeployHealthSummary in <1ms
+    // Verify 15-second TTL deploy health cache returns cached DeployHealthSnapshot in <1ms
     let started = Instant::now();
     let cached_deploy = probe_deploy_and_health("exo-suit", &devops.git, 9000);
     let elapsed = started.elapsed();

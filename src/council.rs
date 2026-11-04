@@ -11,8 +11,8 @@ use crate::models::{
 };
 use crate::providers::{
     build_provider_registry, detect_binary, evaluate_jev_decision_gate, execute_provider_prompt,
-    is_muse_cli_authenticated, run_agy_streaming_turn, run_muse_streaming_turn, AgyParsedEvent,
-    AgyStreamOutcome,
+    is_muse_cli_authenticated, run_agy_streaming_turn, run_muse_streaming_turn, CliStreamEvent,
+    CliStreamOutcome,
 };
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -62,7 +62,7 @@ pub struct SharedAppState {
     pub agents: Vec<AgentNode>,
     pub council: Option<CouncilSession>,
     pub chat_thread: Vec<ChatMessage>,
-    pub custom_chat_messages: Vec<ChatMessage>,
+    pub active_session_live_messages: Vec<ChatMessage>,
     pub session_custom_messages: HashMap<String, Vec<ChatMessage>>,
     pub active_runs: HashMap<String, ActiveRunHandle>,
     pub devops_tests: HashMap<String, crate::models::TestRunSnapshot>,
@@ -88,7 +88,7 @@ impl SharedAppState {
             agents: initial_agents,
             council: None,
             chat_thread: initial_chat,
-            custom_chat_messages: Vec::new(),
+            active_session_live_messages: Vec::new(),
             session_custom_messages: HashMap::new(),
             active_runs: HashMap::new(),
             devops_tests: HashMap::new(),
@@ -188,7 +188,11 @@ impl SharedAppState {
         }
 
         if self.active_session_id == session_id {
-            if let Some(m) = self.custom_chat_messages.iter_mut().find(|m| m.id == msg_id) {
+            if let Some(m) = self
+                .active_session_live_messages
+                .iter_mut()
+                .find(|m| m.id == msg_id)
+            {
                 f(m);
                 updated = true;
             }
@@ -212,10 +216,14 @@ impl SharedAppState {
         }
 
         if self.active_session_id == session_id {
-            if let Some(existing) = self.custom_chat_messages.iter_mut().find(|m| m.id == msg.id) {
+            if let Some(existing) = self
+                .active_session_live_messages
+                .iter_mut()
+                .find(|m| m.id == msg.id)
+            {
                 *existing = msg.clone();
             } else {
-                self.custom_chat_messages.push(msg.clone());
+                self.active_session_live_messages.push(msg.clone());
             }
             if let Some(existing) = self.chat_thread.iter_mut().find(|m| m.id == msg.id) {
                 *existing = msg;
@@ -248,7 +256,7 @@ impl SharedAppState {
             }
         }
         if self.active_session_id == session_id {
-            self.custom_chat_messages = custom;
+            self.active_session_live_messages = custom;
             self.chat_thread = base.clone();
         }
         base
@@ -682,7 +690,7 @@ pub async fn run_independent_prompt(
     if use_live_agy {
         if let Some(agy_bin) = detect_binary(&["agy"]) {
             let existing_conv_id = load_session_agy_conversation_id(&scope.session_id);
-            let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<AgyParsedEvent>();
+            let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<CliStreamEvent>();
 
             let state_for_evts = state.clone();
             let tx_for_evts = tx.clone();
@@ -704,13 +712,13 @@ pub async fn run_independent_prompt(
 
                 while let Some(evt) = evt_rx.recv().await {
                     match evt {
-                        AgyParsedEvent::Init { conversation_id } => {
+                        CliStreamEvent::Init { conversation_id } => {
                             save_session_agy_conversation_id(
                                 &scope_for_evts.session_id,
                                 &conversation_id,
                             );
                         }
-                        AgyParsedEvent::ToolActive {
+                        CliStreamEvent::ToolActive {
                             tool_name, summary, ..
                         } => {
                             step_counter += 1;
@@ -773,7 +781,7 @@ pub async fn run_independent_prompt(
                             st.broadcast_chat_stream(&tx_for_evts, &scope_for_evts.session_id);
                             saw_real_tool = true;
                         }
-                        AgyParsedEvent::ToolDone { tool_name, .. } => {
+                        CliStreamEvent::ToolDone { tool_name, .. } => {
                             let mut st = state_for_evts.write().await;
                             if scope_for_evts.session_id == st.active_session_id {
                                 if let Some(agent) = st
@@ -807,7 +815,7 @@ pub async fn run_independent_prompt(
                             );
                             st.broadcast_chat_stream(&tx_for_evts, &scope_for_evts.session_id);
                         }
-                        AgyParsedEvent::TextDelta {
+                        CliStreamEvent::TextDelta {
                             delta,
                             input_tokens,
                             output_tokens,
@@ -864,7 +872,7 @@ pub async fn run_independent_prompt(
                             );
                             st.broadcast_chat_stream(&tx_for_evts, &scope_for_evts.session_id);
                         }
-                        AgyParsedEvent::Result { .. } => {
+                        CliStreamEvent::Result { .. } => {
                             break;
                         }
                     }
@@ -912,10 +920,10 @@ pub async fn run_independent_prompt(
             };
 
             match outcome {
-                AgyStreamOutcome::Aborted => {
+                CliStreamOutcome::Aborted => {
                     return;
                 }
-                AgyStreamOutcome::Completed {
+                CliStreamOutcome::Completed {
                     text: streamed_text,
                     tokens: final_tokens,
                     interactive_questions,
@@ -1012,7 +1020,7 @@ pub async fn run_independent_prompt(
                     let _ = tx.send(json!({ "type": "DEVOPS_UPDATED", "devops": devops }).to_string());
                     return;
                 }
-                AgyStreamOutcome::CliError(_) => {}
+                CliStreamOutcome::CliError(_) => {}
             }
         }
     }
@@ -1232,7 +1240,7 @@ pub async fn submit_interactive_answer(
             .get(&active_sess)
             .into_iter()
             .flatten()
-            .chain(st.custom_chat_messages.iter())
+            .chain(st.active_session_live_messages.iter())
             .chain(st.chat_thread.iter())
             .filter(|m| {
                 m.interactive_prompt
@@ -2141,7 +2149,7 @@ mod tests {
             active_project: "exo-suit".to_string(),
             active_session_id: active_session_id.to_string(),
             chat_thread: Vec::new(),
-            custom_chat_messages: Vec::new(),
+            active_session_live_messages: Vec::new(),
             session_custom_messages: HashMap::new(),
             active_runs: HashMap::new(),
             devops_tests: HashMap::new(),
@@ -2217,7 +2225,7 @@ mod tests {
         }));
         assert_eq!(state.chat_thread[0].content, "Updated Active");
         assert!(!state.chat_thread[0].streaming);
-        assert_eq!(state.custom_chat_messages[0].content, "Updated Active");
+        assert_eq!(state.active_session_live_messages[0].content, "Updated Active");
         assert_eq!(state.session_custom_messages["session-active"][0].content, "Updated Active");
 
         assert!(state.update_scoped_chat_message("session-bg", "msg-bg", |m| {

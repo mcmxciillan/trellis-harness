@@ -1,4 +1,6 @@
-use crate::brain::{clean_ansi_and_tags, home_dir, parse_ask_question_args, sanitize_code_path};
+use crate::brain::{
+    clean_ansi_and_tags, home_dir, parse_ask_question_args, resolve_workspace_browse_path,
+};
 use crate::models::{
     DecisionEvaluation, DecisionPrimitive, InteractiveQuestionItem, ProviderInfo, TokenMetrics,
 };
@@ -100,7 +102,7 @@ pub fn is_muse_cli_authenticated(api_keys: &HashMap<String, String>) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AgyStreamOutcome {
+pub enum CliStreamOutcome {
     Completed {
         text: String,
         tokens: TokenMetrics,
@@ -109,6 +111,8 @@ pub enum AgyStreamOutcome {
     Aborted,
     CliError(String),
 }
+
+pub type AgyStreamOutcome = CliStreamOutcome;
 
 fn contextualize_cli_prompt(project_id: &str, workspace_path: &Path, prompt: &str) -> String {
     if prompt.starts_with("[Workspace:") {
@@ -320,7 +324,7 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AgyParsedEvent {
+pub enum CliStreamEvent {
     Init {
         conversation_id: String,
     },
@@ -349,6 +353,8 @@ pub enum AgyParsedEvent {
         cache_read_tokens: u64,
     },
 }
+
+pub type AgyParsedEvent = CliStreamEvent;
 
 pub fn map_provider_to_agy_model(provider_id: &str, model: &str) -> String {
     let m = model.trim().to_lowercase();
@@ -1781,7 +1787,7 @@ pub async fn execute_provider_prompt(
     }
 
     let start = Instant::now();
-    let work_dir = sanitize_code_path(active_project);
+    let work_dir = resolve_workspace_browse_path(active_project);
     let sample_files = collect_project_files_preview(&work_dir);
     let contextualized_prompt = format!(
         "[Target Workspace: {} (~/code/{}) | Top-level files: {}]\n\n{}",

@@ -14,8 +14,6 @@ use std::time::{Duration, Instant};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{broadcast, watch, RwLock};
 
-pub type DeployHealthSummary = DeployHealthSnapshot;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TestRunnerSpec {
     pub framework: String,
@@ -25,7 +23,7 @@ pub struct TestRunnerSpec {
 }
 
 static DEPLOY_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<String, (Instant, DeployHealthSummary)>>,
+    std::sync::Mutex<HashMap<String, (Instant, DeployHealthSnapshot)>>,
 > = std::sync::OnceLock::new();
 
 /// Tier 2 Declarative Policy Guard: Validates that `project_id` and optional `target_path`
@@ -371,7 +369,7 @@ pub fn probe_deploy_and_health(
     project_id: &str,
     git: &GitStatusSnapshot,
     port: u16,
-) -> DeployHealthSummary {
+) -> DeployHealthSnapshot {
     let work_dir_opt = validate_workspace_sandbox(project_id, None)
         .ok()
         .map(|(w, _)| w);

@@ -25,6 +25,8 @@
   <a href="#developer-lifecycle-cockpit"><strong>DevOps Cockpit</strong></a> •
   <a href="#quickstart"><strong>Quickstart</strong></a> •
   <a href="#testing-suite"><strong>Testing</strong></a> •
+  <a href="./GLOSSARY.md"><strong>Glossary</strong></a> •
+  <a href="./AGENTS.md"><strong>Agent Guide</strong></a> •
   <a href="./BRAND_GUIDELINES.md"><strong>Brand Guidelines</strong></a>
 </p>
 
@@ -75,51 +77,55 @@ Where raw autonomous agents can become opaque or unruly across multiple reposito
 
 ```mermaid
 flowchart LR
-    subgraph Browser["Trellis Workbench PWA (web/)"]
+    subgraph Browser["WorkbenchClientController (web/app.js)"]
         UI["3-Column Botanical UI\n(Sessions • DAG/Chat • Inspector)"]
         Cockpit["DevOps Lifecycle Cockpit\n(Git Diff • Anchor Tests • Health)"]
         Composer["Prompt Composer & Slash Dock\n(Independent • 3-Stage Council)"]
     end
 
     subgraph Daemon["Single-Binary Rust Daemon (src/)"]
-        Router["Axum HTTP & WS Server\n(src/lib.rs, src/main.rs)"]
-        Brain["Brain & Transcript Engine\n(src/brain.rs)"]
-        Council["Council & Scope Orchestrator\n(src/council.rs)"]
-        Providers["Provider & Jev Gate Adapter\n(src/providers.rs)"]
-        DevOps["DevOps & Git Cockpit Engine\n(src/devops.rs)"]
+        Router["HttpAndWsDeliveryRouter\n(src/lib.rs, src/main.rs)"]
+        Guard["WorkspaceSandboxGuard\n(src/brain.rs, src/devops.rs)"]
+        Brain["SessionTranscriptRepository\n(src/brain.rs)"]
+        State["SharedAppStateRepository &\nCouncilOrchestrator (src/council.rs)"]
+        Providers["UniversalProviderGateway\n(src/providers.rs)"]
+        DevOps["WorkspaceDevOpsGateway\n(src/devops.rs)"]
     end
 
-    subgraph External["Local Sandbox & Model Providers"]
-        FS["~/code/<project> &\n~/.gemini/.../brain/<session>"]
-        CLIs["Local CLIs & APIs\n(agy, claude, codex, deepseek, kimi, gh)"]
-        Jev["TypeSafe AI System-1 Gate\n(jev-latest: Noul / Choice / Score)"]
+    subgraph External["Local Sandbox & 23 Model Providers"]
+        FS["~/code/<project_id> &\n~/.gemini/.../brain/<session_id>"]
+        CLIs["22 CLI & API Agents\n(agy, gemini, muse, claude, codex, copilot, ...)"]
+        Jev["Jev Decision Gate\n(jev-latest: Noul / Choice / Score)"]
     end
 
     UI <-->|"WebSocket JSON Frames\n+ /raw-file + /api/health"| Router
     Cockpit <--> Router
     Composer <--> Router
-    Router --> Brain
-    Router --> Council
-    Router --> DevOps
-    Brain <-->|"notify Watcher +\nSandbox Guards"| FS
+    Router --> Guard
+    Guard --> Brain
+    Guard --> State
+    Guard --> DevOps
+    Brain <-->|"notify Watcher +\nAtomic Writes"| FS
     DevOps <-->|"git / cargo / npm /\npytest / go / gh"| FS
-    Council --> Providers
+    State --> Providers
     Providers <--> CLIs
     Providers <--> Jev
 ```
 
-### Module Map
+### Subsystem Directory & 5-Tier Seam Map
 
-| File | Responsibility |
-| :--- | :--- |
-| [`src/lib.rs`](./src/lib.rs) | Library crate root exposing HTTP routes (`/`, `/api/health`, `/raw-file`, `/ws`), `generate_snapshot_json`, `dispatch_client_command`, and `spawn_brain_watcher`. |
-| [`src/main.rs`](./src/main.rs) | Binary entrypoint initializing `SharedAppState`, binding `0.0.0.0:9000`, and launching the Axum server. |
-| [`src/brain.rs`](./src/brain.rs) | JSONL transcript parser, active subagent/task pruning, `ask_question` reconciliation, sandbox path guards, and workspace/session provisioning. |
-| [`src/council.rs`](./src/council.rs) | `SharedAppState`, zero-bleed session chat scoping, hard execution cancellation (`ActiveRunHandle`), independent prompt runner, and 3-Stage Borda Council engine. |
-| [`src/providers.rs`](./src/providers.rs) | Universal 23-agent provider registry, 7-dialect JSONL stream parser (`agy`, `muse`, `claude`, `gemini`, `codex`, `copilot`, `opencode`), headless CLI & HTTP API adapters, and NaN-safe Jev System-1 evaluation. |
-| [`src/devops.rs`](./src/devops.rs) | Git status/porcelain/numstat parser, bounded unified diff generator, polyglot test runner auto-detector & executor, and CI/health readiness probes. |
-| [`src/models.rs`](./src/models.rs) | Serde data contracts for telemetry snapshots, DAG nodes, Council ballots, DevOps snapshots, and WebSocket client commands. |
-| [`web/`](./web/) | Embedded zero-dependency HTML5 Canvas2D UI (`index.html`, `styles.css`, `app.js`, `manifest.json`). |
+All modules follow the canonical vocabulary in [`GLOSSARY.md`](./GLOSSARY.md) and the 5-Tier seam architecture in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) and [`docs/specs/ARCHITECTURE-SPEC.md`](./docs/specs/ARCHITECTURE-SPEC.md):
+
+| File | Canonical 5-Tier Seam | Responsibility |
+| :--- | :--- | :--- |
+| [`src/lib.rs`](./src/lib.rs) | **`HttpAndWsDeliveryRouter`** (Tier 1) | Library crate root exposing HTTP routes (`/`, `/api/health`, `/raw-file`, `/ws`), `generate_snapshot_json`, `dispatch_client_command`, and `spawn_brain_watcher`. |
+| [`src/main.rs`](./src/main.rs) | **Binary Entrypoint** (Tier 1) | Initializes `SharedAppState`, binds `0.0.0.0:9000`, and launches the Axum server. |
+| [`src/brain.rs`](./src/brain.rs) | **`WorkspaceSandboxGuard`** (Tier 2) & **`SessionTranscriptRepository`** (Tier 3) | Symlink-safe sandbox path guards, JSONL transcript parser, active subagent/task pruning, `ask_question` reconciliation, 19-directory skill scanner, and workspace/session provisioning. |
+| [`src/council.rs`](./src/council.rs) | **`SharedAppStateRepository`** & **`CouncilOrchestrator`** (Tier 3) | Zero-bleed `Session` chat scoping, hard execution cancellation (`ActiveRunHandle`), independent prompt runner, and 3-Stage Borda `CouncilSession` engine. |
+| [`src/providers.rs`](./src/providers.rs) | **`UniversalProviderGateway`** (Tier 4) | Table-driven 23-agent `Provider` registry, 7-dialect JSONL stream parser (`agy`, `muse`, `claude`, `gemini`, `codex`, `copilot`, `opencode`), headless CLI & HTTP API adapters, and NaN-safe `Jev Decision Gate` evaluation. |
+| [`src/devops.rs`](./src/devops.rs) | **`WorkspaceDevOpsGateway`** (Tier 4) | `validate_workspace_sandbox`, Git status/porcelain/numstat parser, bounded unified diff generator, polyglot test runner auto-detector & executor, and TTL-cached CI/health readiness probes. |
+| [`src/models.rs`](./src/models.rs) | **Domain Entity Contracts** (Pillar 1) | Serde data contracts for telemetry snapshots, `AgentNode`, `CouncilSession` ballots, `WorkspaceDevOpsSnapshot`, and `ClientCommand`. |
+| [`web/`](./web/) | **`WorkbenchClientController`** (Tier 5) | Embedded zero-dependency HTML5 Canvas2D UI (`index.html`, `styles.css`, `app.js`, `manifest.json`). |
 
 ---
 
@@ -212,7 +218,7 @@ export GITHUB_TOKEN="..."       # GitHub Copilot API
 
 ## Testing Suite
 
-Trellis includes a **30-test** Rust verification suite spanning in-module unit anchors and 5 black-box integration test binaries in [`tests/`](./tests/):
+Trellis includes a **43-test** Rust verification suite spanning in-module unit anchors and 5 black-box integration test binaries in [`tests/`](./tests/):
 
 ```bash
 # Run the entire unit + integration test suite
@@ -221,12 +227,12 @@ cargo test
 
 | Test Target | Command | Coverage |
 | :--- | :--- | :--- |
-| **Library Unit Anchors** | `cargo test --lib` | Core invariants across `brain`, `council`, and `devops` (`8 tests`) |
-| **Seam 1 — Brain & Transcript** | `cargo test --test seam_1_brain_and_transcript` | ANSI stripping, `ask_question` parsing, sandbox file resolution, subagent pruning & task capsules (`5 tests`) |
-| **Seam 2 — Provisioning & Scope** | `cargo test --test seam_2_provisioning_and_scope` | Slug validation, greenfield/existing repo provisioning, session renaming & scope resolution (`3 tests`) |
-| **Seam 3 — Council & Providers** | `cargo test --test seam_3_council_and_providers` | NaN-safe probability clamping, Jev System-1 gate, 3-stage Borda no-self-voting & hard cancellation (`5 tests`) |
-| **Seam 4 — DevOps Cockpit** | `cargo test --test seam_4_devops_cockpit` | Sandbox guards, git porcelain/rename/numstat parsing, polyglot test detection & diff synthesis (`5 tests`) |
-| **Seam 5 — HTTP & WS Server** | `cargo test --test seam_5_http_and_ws_server` | Live Axum HTTP asset/health routes, `/raw-file` traversal blocking, telemetry snapshot & WS command dispatch (`4 tests`) |
+| **Library Unit Anchors** | `cargo test --lib` | Core invariants across `brain`, `council`, and `devops` (`11 tests`) |
+| **Seam 1 — Brain & Transcript** | `cargo test --test seam_1_brain_and_transcript` | ANSI stripping, `ask_question` parsing, sandbox file resolution, atomic writes, subagent pruning & task capsules (`7 tests`) |
+| **Seam 2 — Provisioning & Scope** | `cargo test --test seam_2_provisioning_and_scope` | Slug validation, greenfield/existing repo provisioning, session renaming & `ExecutionScope` resolution (`3 tests`) |
+| **Seam 3 — Council & Providers** | `cargo test --test seam_3_council_and_providers` | 23-agent `Provider` registry, 7 CLI JSONL dialects, `OnceLock` binary cache, NaN-safe `Jev Decision Gate`, 3-stage Borda no-self-voting & hard cancellation (`11 tests`) |
+| **Seam 4 — DevOps Cockpit** | `cargo test --test seam_4_devops_cockpit` | Symlink-safe `WorkspaceSandboxGuard`, git porcelain/rename/numstat parsing, polyglot test detection & diff synthesis (`6 tests`) |
+| **Seam 5 — HTTP & WS Server** | `cargo test --test seam_5_http_and_ws_server` | Live Axum HTTP asset/health routes, `/raw-file` traversal blocking, telemetry snapshot, typed `COMMAND_ERROR` envelopes & WS command dispatch (`5 tests`) |
 
 ---
 
@@ -249,7 +255,7 @@ cargo test
 | **Neutral Mid** | Weathered Trellis | `#7D796F` | Secondary copy, `0.5px` hairline lattice guides, passive scaffolds |
 | **Surface Dark** | Basalt | `#181816` | IDE backgrounds, code blocks, dark-mode root layer |
 
-See [`BRAND_GUIDELINES.md`](./BRAND_GUIDELINES.md) for full logo lockup, typography, and visual language rules, and [`docs/specs/ARCHITECTURE-SPEC.md`](./docs/specs/ARCHITECTURE-SPEC.md) for the 8-Pillar architectural specification.
+See [`GLOSSARY.md`](./GLOSSARY.md) for the canonical project vocabulary, [`AGENTS.md`](./AGENTS.md) for agent context rules, [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) and [`docs/specs/ARCHITECTURE-SPEC.md`](./docs/specs/ARCHITECTURE-SPEC.md) for the 5-Tier deep seam specifications, and [`BRAND_GUIDELINES.md`](./BRAND_GUIDELINES.md) for full logo lockup, typography, and visual language rules.
 
 ---
 

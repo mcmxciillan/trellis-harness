@@ -15,7 +15,7 @@ fn make_test_context() -> ServerContext {
         agents: Vec::new(),
         council: None,
         chat_thread: Vec::new(),
-        custom_chat_messages: Vec::new(),
+        active_session_live_messages: Vec::new(),
         session_custom_messages: HashMap::new(),
         active_runs: HashMap::new(),
         devops_tests: HashMap::new(),

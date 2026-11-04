@@ -78,7 +78,7 @@ pub fn clean_ansi_and_tags(text: &str) -> String {
     out.trim().to_string()
 }
 
-pub fn sanitize_code_path(requested: &str) -> PathBuf {
+pub fn resolve_workspace_browse_path(requested: &str) -> PathBuf {
     let root = code_root_dir();
     let candidate = if requested.is_empty() || requested == "." {
         root.clone()
@@ -103,7 +103,7 @@ pub fn sanitize_code_path(requested: &str) -> PathBuf {
 
 pub fn list_directory_contents(target_path: &str) -> FileTreeInfo {
     let root = fs::canonicalize(code_root_dir()).unwrap_or_else(|_| code_root_dir());
-    let safe_path = sanitize_code_path(target_path);
+    let safe_path = resolve_workspace_browse_path(target_path);
 
     let rel_path = safe_path
         .strip_prefix(&root)
@@ -469,10 +469,10 @@ pub fn resolve_execution_scope(session_id: &str, requested_project: &str) -> Exe
     };
 
     let root = fs::canonicalize(code_root_dir()).unwrap_or_else(|_| code_root_dir());
-    let safe_path = sanitize_code_path(&candidate_proj);
+    let safe_path = resolve_workspace_browse_path(&candidate_proj);
     let resolved_proj = if safe_path == root {
         // If requested_project escaped ~/code or was root, fall back to exo-suit if it exists
-        let fallback = sanitize_code_path("exo-suit");
+        let fallback = resolve_workspace_browse_path("exo-suit");
         if fallback != root {
             return ExecutionScope {
                 session_id: clean_session,

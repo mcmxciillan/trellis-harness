@@ -53,7 +53,7 @@ pub fn build_workspace_devops_snapshot(
 ```
 - **Encapsulated Invariants**:
   1. **Canonical Symlink-Safe Sandbox Validation**: `validate_workspace_sandbox` canonicalizes `work_dir`, and when `target_path` is provided and exists on disk, canonicalizes `candidate` (or its parent directory) and verifies `canon_target.starts_with(&canon_work_dir)`, rejecting symlink escapes outside the workspace.
-  2. **TTL-Cached Deploy & Git Projections**: `probe_deploy_and_health` caches `(project_id -> (Instant, DeployHealthSummary))` in a thread-safe cache with a 15-second TTL and skips blocking `gh` invocations when a fresh snapshot exists or when running in fast unit-test mode, preventing repetitive network CLI stalls on every WebSocket message.
+  2. **TTL-Cached Deploy & Git Projections**: `probe_deploy_and_health` caches `(project_id -> (Instant, DeployHealthSnapshot))` in a thread-safe cache with a 15-second TTL and skips blocking `gh` invocations when a fresh snapshot exists or when running in fast unit-test mode, preventing repetitive network CLI stalls on every WebSocket message.
   3. **Structured Test Runner Spec**: `detect_test_runner_spec_in_dir` returns explicit `(program, args)` vectors used directly by `run_workspace_tests` without fragile whitespace splitting.
 - **After Diagram**:
 ```mermaid
@@ -69,7 +69,7 @@ graph TD
 ## 4. Step-by-Step Implementation Plan
 1. Upgrade `validate_workspace_sandbox` in `src/devops.rs` to verify canonical path containment for existing paths/symlinks inside `work_dir`.
 2. Introduce `TestRunnerSpec` and `detect_test_runner_spec_in_dir` (keeping `detect_test_runner_in_dir` as a thin compatibility wrapper returning `(framework, display_command)`), and update `run_workspace_tests` to invoke `spec.program` and `spec.args` directly.
-3. Add a `Mutex<HashMap<String, (Instant, DeployHealthSummary)>>` 15-second TTL cache around `probe_deploy_and_health` so repeated snapshot calls within 15 seconds return in `<1ms` without spawning redundant `gh` CLI network processes.
+3. Add a `Mutex<HashMap<String, (Instant, DeployHealthSnapshot)>>` 15-second TTL cache around `probe_deploy_and_health` so repeated snapshot calls within 15 seconds return in `<1ms` without spawning redundant `gh` CLI network processes.
 4. Add a symlink escape test and `TestRunnerSpec` test in `tests/seam_4_devops_cockpit.rs`.
 
 ---
@@ -77,4 +77,4 @@ graph TD
 ## 5. Completion Criteria & Quality Gate
 - [ ] `cargo test --test seam_4_devops_cockpit` passes (`GREEN`).
 - [ ] Symlinks pointing outside `work_dir` are deterministically rejected by `validate_workspace_sandbox`.
-- [ ] Repeated calls to `build_workspace_devops_snapshot` reuse the cached `DeployHealthSummary` within the TTL window.
+- [ ] Repeated calls to `build_workspace_devops_snapshot` reuse the cached `DeployHealthSnapshot` within the TTL window.
