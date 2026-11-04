@@ -882,6 +882,9 @@ pub fn get_tool_catalog() -> Vec<ToolCatalogItem> {
 
 pub fn get_session_artifacts(session_id: &str) -> Vec<ArtifactItem> {
     let mut artifacts = Vec::new();
+    if !is_valid_session_id(session_id) {
+        return artifacts;
+    }
     let s_path = brain_dir().join(session_id);
     if !s_path.exists() {
         return artifacts;
@@ -939,6 +942,9 @@ pub fn get_session_artifacts(session_id: &str) -> Vec<ArtifactItem> {
 }
 
 pub fn approve_artifact_metadata(session_id: &str, artifact_name: &str) -> bool {
+    if !is_valid_session_id(session_id) || !is_valid_session_id(artifact_name) {
+        return false;
+    }
     let meta_p = brain_dir()
         .join(session_id)
         .join(format!("{}.metadata.json", artifact_name));
