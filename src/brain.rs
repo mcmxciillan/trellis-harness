@@ -741,6 +741,18 @@ pub fn get_installed_skills() -> Vec<SkillItem> {
         &mut skills,
         &mut seen,
     );
+    scan_skills_dir(
+        &home.join(".config").join("muse").join("skills"),
+        "muse-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".agents").join("skills"),
+        "agents-skills",
+        &mut skills,
+        &mut seen,
+    );
 
     // Also scan plugin skills under ~/.gemini/config/plugins/*/skills
     let plugins_dir = gemini.join("config").join("plugins");

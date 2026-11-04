@@ -16,7 +16,9 @@ static BIN_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::n
 
 pub fn detect_binary(candidates: &[&str]) -> Option<String> {
     let cache_mutex = BIN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let local_bin = home_dir().join(".local").join("bin");
+    let home = home_dir();
+    let local_bin = home.join(".local").join("bin");
+    let muse_bin_dir = home.join(".muse").join("bin");
 
     for &c in candidates {
         if let Ok(guard) = cache_mutex.lock() {
@@ -33,8 +35,11 @@ pub fn detect_binary(candidates: &[&str]) -> Option<String> {
             Some(c.to_string())
         } else {
             let user_local = local_bin.join(c);
+            let user_muse = muse_bin_dir.join(c);
             if user_local.exists() {
                 Some(user_local.to_string_lossy().to_string())
+            } else if user_muse.exists() {
+                Some(user_muse.to_string_lossy().to_string())
             } else if let Ok(output) = std::process::Command::new("which").arg(c).output() {
                 if output.status.success() {
                     let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -70,6 +75,7 @@ pub fn resolve_api_model_name(provider_id: &str, requested_model: &str) -> Strin
     match provider_id {
         "antigravity" => "gemini-4-argon".to_string(),
         "jev" => "jev-latest".to_string(),
+        "muse" => "muse-spark-1.3".to_string(),
         "claude" => "claude-4-sonnet".to_string(),
         "codex" => "codex-mini-latest".to_string(),
         "copilot" => "copilot-gpt-4o".to_string(),
@@ -77,6 +83,25 @@ pub fn resolve_api_model_name(provider_id: &str, requested_model: &str) -> Strin
         "kimi" => "kimi-k2-5".to_string(),
         _ => "gpt-4o".to_string(),
     }
+}
+
+/// Checks whether Meta Muse Code (`muse`) has active non-interactive credentials
+/// (either `META_API_KEY` / `MODEL_API_KEY`, runtime key, or `~/.config/muse/auth.json`).
+pub fn is_muse_cli_authenticated(api_keys: &HashMap<String, String>) -> bool {
+    if resolve_key(api_keys, "muse", &["META_API_KEY", "MODEL_API_KEY"]).is_some() {
+        return true;
+    }
+    let auth_path = std::env::var("MUSE_AUTH_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config").join("muse").join("auth.json"));
+    if let Ok(meta) = std::fs::metadata(&auth_path) {
+        if meta.is_file() && meta.len() > 4 {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Debug)]
@@ -354,6 +379,15 @@ pub enum AgyParsedEvent {
 pub fn map_provider_to_agy_model(provider_id: &str, model: &str) -> String {
     let m = model.trim().to_lowercase();
     match provider_id {
+        "muse" => {
+            if m.contains("glimmer") {
+                "gemini-3.8-flash-medium".to_string()
+            } else if m.contains("wonder") || m.contains("1.3") {
+                "gemini-4-argon-high".to_string()
+            } else {
+                "gemini-4-argon-medium".to_string()
+            }
+        }
         "claude" => {
             if m.contains("opus") {
                 if m.contains("low") {
@@ -392,12 +426,341 @@ pub fn map_provider_to_agy_model(provider_id: &str, model: &str) -> String {
     }
 }
 
+/// Parses a single JSONL line from `muse exec --json` (Muse Session Protocol / MSP v1)
+/// into the unified `AgyParsedEvent` stream contract.
+pub fn parse_muse_stream_json_line(line: &str, active_project: &str) -> Option<AgyParsedEvent> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let val: Value = serde_json::from_str(trimmed).ok()?;
+    let payload_type = val.get("payload_type")?.as_str()?;
+    let payload = val.get("payload").unwrap_or(&val);
+    let seq = val.get("sequence").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+
+    match payload_type {
+        "session.run.linked" | "runtime.command.accepted" => {
+            let sid = val
+                .get("stream")
+                .and_then(|s| s.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if sid.is_empty() {
+                None
+            } else {
+                Some(AgyParsedEvent::Init {
+                    conversation_id: sid,
+                })
+            }
+        }
+        "task.lifecycle.side_effect_intent" => {
+            let ev = payload.get("event")?;
+            let op = ev
+                .get("operation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("muse_task");
+            if op.starts_with("model.") || op.starts_with("reminder.") {
+                return None;
+            }
+            let tool_name = if op.contains("read") || op.contains("view") {
+                "read_file".to_string()
+            } else if op.contains("edit") || op.contains("patch") || op.contains("write") {
+                "edit_file".to_string()
+            } else if op.contains("shell") || op.contains("exec") || op.contains("command") {
+                "run_command".to_string()
+            } else {
+                op.to_string()
+            };
+            let summary = ev
+                .get("idempotency_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.chars().take(72).collect())
+                .unwrap_or_else(|| format!("~/code/{}", active_project));
+            Some(AgyParsedEvent::ToolActive {
+                step_index: seq,
+                tool_name,
+                summary,
+                questions: Vec::new(),
+            })
+        }
+        "run.output.delta" => {
+            let delta = payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if delta.is_empty() {
+                None
+            } else {
+                Some(AgyParsedEvent::TextDelta {
+                    step_index: seq,
+                    delta,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                })
+            }
+        }
+        "run.usage" => {
+            let first_model = payload
+                .get("models")
+                .and_then(|m| m.as_array())
+                .and_then(|a| a.first());
+            let input_tokens = first_model
+                .and_then(|m| m.get("input_tokens"))
+                .and_then(|v| v.as_u64());
+            let output_tokens = first_model
+                .and_then(|m| m.get("output_tokens"))
+                .and_then(|v| v.as_u64());
+            let cache_read_tokens = first_model
+                .and_then(|m| m.get("cached_tokens"))
+                .and_then(|v| v.as_u64());
+            if input_tokens.is_some() || output_tokens.is_some() {
+                Some(AgyParsedEvent::TextDelta {
+                    step_index: seq,
+                    delta: String::new(),
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                })
+            } else {
+                None
+            }
+        }
+        "run.terminal.completed" => {
+            let sid = val
+                .get("stream")
+                .and_then(|s| s.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let text = payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(AgyParsedEvent::Result {
+                conversation_id: sid,
+                response: text,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+            })
+        }
+        _ => None,
+    }
+}
+
+pub async fn run_muse_streaming_turn<F>(
+    muse_bin: &str,
+    workspace_path: &std::path::Path,
+    project_id: &str,
+    model: &str,
+    api_key: Option<&str>,
+    prompt: &str,
+    abort_rx: &mut tokio::sync::watch::Receiver<bool>,
+    mut on_event: F,
+) -> AgyStreamOutcome
+where
+    F: FnMut(AgyParsedEvent),
+{
+    if *abort_rx.borrow() {
+        return AgyStreamOutcome::Aborted;
+    }
+
+    let resolved_model = resolve_api_model_name("muse", model);
+    let contextualized_prompt = if prompt.starts_with("[Workspace:") {
+        prompt.to_string()
+    } else {
+        format!(
+            "[Workspace: {} ({})]\n\n{}",
+            project_id,
+            workspace_path.display(),
+            prompt
+        )
+    };
+
+    let mut cmd = Command::new(muse_bin);
+    cmd.current_dir(workspace_path);
+    if let Some(k) = api_key {
+        if !k.trim().is_empty() {
+            cmd.env("META_API_KEY", k.trim());
+        }
+    }
+    cmd.arg("exec")
+        .arg("--json")
+        .arg("--model")
+        .arg(&resolved_model)
+        .arg("--workspace")
+        .arg(workspace_path)
+        .arg("--trust-workspace")
+        .arg("--disable-approval")
+        .arg("--user-input-auto-resolve")
+        .arg(&contextualized_prompt)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return AgyStreamOutcome::CliError(format!(
+                "Failed to spawn muse CLI ({}): {}",
+                muse_bin, e
+            ));
+        }
+    };
+
+    let mut streamed_text = String::new();
+    let mut final_tokens = TokenMetrics {
+        input_tokens: (prompt.len() as u64 / 3) + 320,
+        cache_read_tokens: 900,
+        output_tokens: 0,
+    };
+
+    let stderr = child.stderr.take();
+    if let Some(stdout) = child.stdout.take() {
+        let mut lines = BufReader::new(stdout).lines();
+        loop {
+            let line_res = tokio::select! {
+                l = lines.next_line() => l,
+                _ = abort_rx.changed() => {
+                    if *abort_rx.borrow() {
+                        let _ = child.kill().await;
+                        return AgyStreamOutcome::Aborted;
+                    }
+                    continue;
+                }
+            };
+
+            let Some(line) = (match line_res {
+                Ok(Some(l)) => Some(l),
+                _ => None,
+            }) else {
+                break;
+            };
+
+            let Some(evt) = parse_muse_stream_json_line(&line, project_id) else {
+                continue;
+            };
+
+            on_event(evt.clone());
+
+            if *abort_rx.borrow() {
+                let _ = child.kill().await;
+                return AgyStreamOutcome::Aborted;
+            }
+
+            match evt {
+                AgyParsedEvent::TextDelta {
+                    delta,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    ..
+                } => {
+                    if !delta.is_empty() {
+                        streamed_text.push_str(&delta);
+                    }
+                    if let Some(it) = input_tokens {
+                        if it > 0 {
+                            final_tokens.input_tokens = it;
+                        }
+                    }
+                    if let Some(ot) = output_tokens {
+                        if ot > 0 {
+                            final_tokens.output_tokens = ot;
+                        }
+                    }
+                    if let Some(crt) = cache_read_tokens {
+                        if crt > 0 {
+                            final_tokens.cache_read_tokens = crt;
+                        }
+                    }
+                }
+                AgyParsedEvent::Result {
+                    response,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    ..
+                } => {
+                    if streamed_text.trim().is_empty() && !response.trim().is_empty() {
+                        streamed_text = response;
+                    }
+                    if input_tokens > 0 {
+                        final_tokens.input_tokens = input_tokens;
+                    }
+                    if output_tokens > 0 {
+                        final_tokens.output_tokens = output_tokens;
+                    }
+                    if cache_read_tokens > 0 {
+                        final_tokens.cache_read_tokens = cache_read_tokens;
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    drop(on_event);
+
+    if *abort_rx.borrow() {
+        let _ = child.kill().await;
+        return AgyStreamOutcome::Aborted;
+    }
+
+    if !streamed_text.trim().is_empty() {
+        let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+        let _ = child.start_kill();
+        if final_tokens.output_tokens == 0 {
+            final_tokens.output_tokens = (streamed_text.len() as u64 / 3).max(48);
+        }
+        return AgyStreamOutcome::Completed {
+            text: streamed_text,
+            tokens: final_tokens,
+            interactive_questions: Vec::new(),
+        };
+    }
+
+    let mut stderr_buf = String::new();
+    if let Some(mut se) = stderr {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(400),
+            se.read_to_string(&mut stderr_buf),
+        )
+        .await;
+    }
+    let status = tokio::time::timeout(Duration::from_millis(400), child.wait())
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+    let _ = child.start_kill();
+
+    let stderr_msg = clean_ansi_and_tags(&stderr_buf).trim().to_string();
+    if !stderr_msg.is_empty() {
+        AgyStreamOutcome::CliError(stderr_msg)
+    } else {
+        let code_str = status
+            .and_then(|s| s.code())
+            .map(|c| format!("exit code {}", c))
+            .unwrap_or_else(|| "empty output".to_string());
+        AgyStreamOutcome::CliError(format!("muse CLI exited with {}", code_str))
+    }
+}
+
 pub fn parse_agy_stream_json_line(line: &str, active_project: &str) -> Option<AgyParsedEvent> {
     let trimmed = line.trim();
     if !trimmed.starts_with('{') {
         return None;
     }
     let val: Value = serde_json::from_str(trimmed).ok()?;
+    if val.get("payload_type").is_some() {
+        return parse_muse_stream_json_line(trimmed, active_project);
+    }
     let ev_type = val.get("event")?.as_str()?;
 
     match ev_type {
@@ -563,6 +926,7 @@ pub fn parse_agy_stream_json_line(line: &str, active_project: &str) -> Option<Ag
 
 pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<ProviderInfo> {
     let agy_bin = detect_binary(&["agy"]);
+    let muse_bin = detect_binary(&["/opt/homebrew/bin/muse", "muse"]).or_else(|| agy_bin.clone());
     let claude_bin = detect_binary(&["/opt/homebrew/bin/claude", "claude"]).or_else(|| agy_bin.clone());
     let codex_bin = detect_binary(&["/opt/homebrew/bin/codex", "codex"]).or_else(|| agy_bin.clone());
     let gh_bin = detect_binary(&["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "gh"]);
@@ -581,6 +945,7 @@ pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<Provid
     };
 
     let agy_key = has_key(&["GEMINI_API_KEY", "GOOGLE_API_KEY"], "antigravity");
+    let muse_key = has_key(&["META_API_KEY", "MODEL_API_KEY"], "muse");
     let claude_key = has_key(&["ANTHROPIC_API_KEY"], "claude");
     let codex_key = has_key(&["OPENAI_API_KEY"], "codex");
     let copilot_key = has_key(&["GITHUB_TOKEN", "GH_TOKEN"], "copilot");
@@ -637,6 +1002,27 @@ pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<Provid
             },
             cli_path: None,
             has_api_key: jev_key,
+            enabled_in_council: true,
+        },
+        ProviderInfo {
+            id: "muse".to_string(),
+            name: "Meta Muse Code (muse)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Long-Horizon Agentic Coding, Worktree Subagents & 1M Context".to_string(),
+            default_model: "muse-spark-1.3".to_string(),
+            available_models: vec![
+                "muse-spark-1.3".to_string(),
+                "muse-wonder-1.0".to_string(),
+                "muse-spark-1.2".to_string(),
+                "muse-spark-1.3-contributor".to_string(),
+                "muse-spark-open".to_string(),
+                "muse-glimmer".to_string(),
+            ],
+            color: "#0064E0".to_string(),
+            icon: "♾️".to_string(),
+            mode: mode_for(&muse_bin, muse_key),
+            cli_path: muse_bin,
+            has_api_key: muse_key,
             enabled_in_council: true,
         },
         ProviderInfo {
@@ -1330,11 +1716,102 @@ pub async fn execute_provider_prompt(
                 }
             }
         }
+        "muse" => {
+            if let Some(key) = resolve_key(api_keys, "muse", &["META_API_KEY", "MODEL_API_KEY"]) {
+                if !key.is_empty() {
+                    match call_openai_compatible(
+                        &client,
+                        "https://api.meta.ai/v1/chat/completions",
+                        &key,
+                        &api_model,
+                        &contextualized_prompt,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let iqs = maybe_extract_or_synthesize_questions(
+                                prompt,
+                                &text,
+                                active_project,
+                                fast_council_stage,
+                            );
+                            return ProviderResponse {
+                                text,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API".to_string(),
+                                decision_eval: None,
+                                interactive_questions: iqs,
+                            };
+                        }
+                        Err(diag) => {
+                            return ProviderResponse {
+                                text: format!(
+                                    "⚠️ [MUSE • {}] Live API Error: {}",
+                                    api_model, diag
+                                ),
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API_ERROR".to_string(),
+                                decision_eval: None,
+                                interactive_questions: Vec::new(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
 
+    if !fast_council_stage && provider_id == "muse" && is_muse_cli_authenticated(api_keys) {
+        if let Some(muse_bin) = detect_binary(&["/opt/homebrew/bin/muse", "muse"]) {
+            let mut cmd = Command::new(&muse_bin);
+            if let Some(key) = resolve_key(api_keys, "muse", &["META_API_KEY", "MODEL_API_KEY"]) {
+                if !key.is_empty() {
+                    cmd.env("META_API_KEY", key);
+                }
+            }
+            cmd.arg("exec")
+                .arg("--model")
+                .arg(&api_model)
+                .arg("--workspace")
+                .arg(&work_dir)
+                .arg("--trust-workspace")
+                .arg("--disable-approval")
+                .arg("--user-input-auto-resolve")
+                .arg(&contextualized_prompt)
+                .current_dir(&work_dir)
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let fut = cmd.output();
+
+            if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(185), fut).await {
+                let stdout = clean_ansi_and_tags(&String::from_utf8_lossy(&output.stdout));
+                if !stdout.is_empty() && output.status.success() {
+                    let iqs = maybe_extract_or_synthesize_questions(
+                        prompt,
+                        &stdout,
+                        active_project,
+                        fast_council_stage,
+                    );
+                    return ProviderResponse {
+                        text: stdout,
+                        latency_ms: start.elapsed().as_millis() as u64,
+                        execution_mode: "LIVE_CLI".to_string(),
+                        decision_eval: None,
+                        interactive_questions: iqs,
+                    };
+                }
+            }
+        }
+    }
+
     if !fast_council_stage
-        && (provider_id == "antigravity" || provider_id == "claude" || provider_id == "codex")
+        && (provider_id == "antigravity"
+            || provider_id == "muse"
+            || provider_id == "claude"
+            || provider_id == "codex")
     {
         if let Some(agy_bin) = detect_binary(&["agy"]) {
             let agy_model = map_provider_to_agy_model(provider_id, model);
@@ -1374,6 +1851,7 @@ pub async fn execute_provider_prompt(
 
     let delay_ms = match provider_id {
         "antigravity" => 260,
+        "muse" => 280,
         "claude" => 340,
         "codex" => 210,
         "copilot" => 240,
@@ -1391,7 +1869,10 @@ pub async fn execute_provider_prompt(
     ProviderResponse {
         text,
         latency_ms: start.elapsed().as_millis() as u64,
-        execution_mode: if provider_id == "antigravity" || provider_id == "copilot" {
+        execution_mode: if provider_id == "antigravity"
+            || provider_id == "muse"
+            || provider_id == "copilot"
+        {
             "LIVE_CLI_HYBRID".to_string()
         } else {
             "SIMULATED".to_string()
@@ -1553,6 +2034,13 @@ fn synthesize_provider_perspective(
             • Workspace Context: Scanned `{}`.\n\
             • Proposal for \"{}\": Structure the execution pipeline around lock-free bounded channels (`tokio::sync::broadcast`) and deterministic Anchor verification gates.\n\
             • Key Advantage: Eliminates DOM/heap churn while preserving full transcript traceability in `~/.gemini/antigravity-cli/brain`.",
+            model, project, file_list, clean_q
+        ),
+        "muse" => format!(
+            "[Meta Muse Code • {}] 1M-Context Agentic & Worktree Synthesis for `{}`:\n\
+            • Workspace Context: Audited `{}` with 4-observer background verification (Memory, Skill, Goal, Verify).\n\
+            • Proposal for \"{}\": Isolate multi-file mutations in a dedicated Git worktree (`muse -w`), execute parallel tool calls across subagents, and validate against MSP schema contracts.\n\
+            • Key Advantage: Combines 1,048,576-token context horizon with OS-sandboxed shell execution and deterministic goal tracking.",
             model, project, file_list, clean_q
         ),
         "claude" => format!(

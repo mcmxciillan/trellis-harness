@@ -11,7 +11,8 @@ use crate::models::{
 };
 use crate::providers::{
     build_provider_registry, detect_binary, evaluate_jev_decision_gate, execute_provider_prompt,
-    run_agy_streaming_turn, AgyParsedEvent, AgyStreamOutcome,
+    is_muse_cli_authenticated, run_agy_streaming_turn, run_muse_streaming_turn, AgyParsedEvent,
+    AgyStreamOutcome,
 };
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -600,8 +601,14 @@ pub async fn run_independent_prompt(
     let reply_id = format!("reply-{}", node_id);
     let task_node_id = format!("task-{}", node_id);
 
+    let muse_cli_ready = provider_id == "muse"
+        && is_muse_cli_authenticated(&api_keys)
+        && detect_binary(&["/opt/homebrew/bin/muse", "muse"]).is_some();
+
     let use_live_agy = p_info.model_class != "DECISION_SYSTEM_1"
         && (provider_id == "antigravity"
+            || muse_cli_ready
+            || (provider_id == "muse" && !p_info.has_api_key)
             || (provider_id == "claude" && !p_info.has_api_key)
             || (provider_id == "codex" && !p_info.has_api_key));
 
@@ -832,22 +839,43 @@ pub async fn run_independent_prompt(
                 step_counter
             };
 
-            let (outcome, step_counter) = tokio::join!(
-                run_agy_streaming_turn(
-                    &agy_bin,
-                    &scope.workspace_path,
-                    &scope.project_id,
-                    &provider_id,
-                    &model,
-                    existing_conv_id.as_deref(),
-                    &prompt,
-                    &mut abort_rx,
-                    move |evt| {
-                        let _ = evt_tx.send(evt);
-                    },
-                ),
-                event_consumer
-            );
+            let (outcome, step_counter) = if muse_cli_ready {
+                let muse_bin = detect_binary(&["/opt/homebrew/bin/muse", "muse"])
+                    .unwrap_or_else(|| agy_bin.clone());
+                let muse_key = api_keys.get("muse").map(|s| s.as_str());
+                tokio::join!(
+                    run_muse_streaming_turn(
+                        &muse_bin,
+                        &scope.workspace_path,
+                        &scope.project_id,
+                        &model,
+                        muse_key,
+                        &prompt,
+                        &mut abort_rx,
+                        move |evt| {
+                            let _ = evt_tx.send(evt);
+                        },
+                    ),
+                    event_consumer
+                )
+            } else {
+                tokio::join!(
+                    run_agy_streaming_turn(
+                        &agy_bin,
+                        &scope.workspace_path,
+                        &scope.project_id,
+                        &provider_id,
+                        &model,
+                        existing_conv_id.as_deref(),
+                        &prompt,
+                        &mut abort_rx,
+                        move |evt| {
+                            let _ = evt_tx.send(evt);
+                        },
+                    ),
+                    event_consumer
+                )
+            };
 
             match outcome {
                 AgyStreamOutcome::Aborted => {

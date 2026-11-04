@@ -115,7 +115,7 @@ flowchart LR
 | [`src/main.rs`](./src/main.rs) | Binary entrypoint initializing `SharedAppState`, binding `0.0.0.0:9000`, and launching the Axum server. |
 | [`src/brain.rs`](./src/brain.rs) | JSONL transcript parser, active subagent/task pruning, `ask_question` reconciliation, sandbox path guards, and workspace/session provisioning. |
 | [`src/council.rs`](./src/council.rs) | `SharedAppState`, zero-bleed session chat scoping, hard execution cancellation (`ActiveRunHandle`), independent prompt runner, and 3-Stage Borda Council engine. |
-| [`src/providers.rs`](./src/providers.rs) | Multi-provider registry (`agy`, `claude`, `codex`, `deepseek`, `kimi`, `copilot`, `jev`), CLI/API execution adapters, and NaN-safe Jev System-1 evaluation. |
+| [`src/providers.rs`](./src/providers.rs) | Multi-provider registry (`agy`, `muse`, `claude`, `codex`, `deepseek`, `kimi`, `copilot`, `jev`), CLI/API execution adapters, and NaN-safe Jev System-1 evaluation. |
 | [`src/devops.rs`](./src/devops.rs) | Git status/porcelain/numstat parser, bounded unified diff generator, polyglot test runner auto-detector & executor, and CI/health readiness probes. |
 | [`src/models.rs`](./src/models.rs) | Serde data contracts for telemetry snapshots, DAG nodes, Council ballots, DevOps snapshots, and WebSocket client commands. |
 | [`web/`](./web/) | Embedded zero-dependency HTML5 Canvas2D UI (`index.html`, `styles.css`, `app.js`, `manifest.json`). |
@@ -124,12 +124,13 @@ flowchart LR
 
 ## Multi-Provider & 3-Stage Council Engine
 
-Trellis orchestrates **7 AI providers** across two distinct cognitive classes:
+Trellis orchestrates **8 AI providers** across two distinct cognitive classes:
 
 | Provider | Model Class | Default Model | Specialty |
 | :--- | :--- | :--- | :--- |
 | **Jev (`jev-latest`)** | `DECISION_SYSTEM_1` | `jev-latest` | Sub-200ms TypeSafe AI System-1 decision primitives (`Noul` risk probability, `Choice` routing verdict, `Score` rubric compliance) with NaN-safe fail-closed fallback |
 | **Antigravity (`agy`)** | `GENERATIVE_SYSTEM_2` | `gemini-4-argon` | Multi-agent graph orchestration & deep repository execution |
+| **Meta Muse Code (`muse`)** | `GENERATIVE_SYSTEM_2` | `muse-spark-1.3` | Long-horizon agentic coding, worktree subagents & 1M-context reasoning (`muse-spark-1.3`, `muse-wonder-1.0`, `muse-spark-open`, `muse-glimmer`) |
 | **Claude Code** | `GENERATIVE_SYSTEM_2` | `claude-4-sonnet` | Deep module design, boundary invariants & adversarial review |
 | **OpenAI Codex** | `GENERATIVE_SYSTEM_2` | `codex-mini-latest` | Low-latency code synthesis & surgical patching |
 | **DeepSeek** | `GENERATIVE_SYSTEM_2` | `deepseek-reasoner` | First-principles algorithmic reasoning & math verification |
@@ -176,11 +177,12 @@ Open **`http://127.0.0.1:9000`** in any desktop or mobile browser. Because `web/
 
 ### Optional Provider Environment Variables
 
-Trellis auto-detects installed local CLIs (`agy`, `claude`, `codex`, `gh`) and also accepts API keys via environment variables or the in-app **🔑 Keys** modal (held strictly in process memory and never written to disk):
+Trellis auto-detects installed local CLIs (`agy`, `muse`, `claude`, `codex`, `gh`) and also accepts API keys via environment variables or the in-app **🔑 Keys** modal (held strictly in process memory and never written to disk):
 
 ```bash
 export JEV_API_KEY="..."        # TypeSafe AI Jev System-1 Gate (https://api.typesafe.ai/v1/evaluate)
 export GEMINI_API_KEY="..."     # Google Gemini / Antigravity API
+export META_API_KEY="..."       # Meta Muse Code / Meta Model API (https://api.meta.ai/v1)
 export ANTHROPIC_API_KEY="..."  # Anthropic Claude API
 export OPENAI_API_KEY="..."     # OpenAI / Codex API
 export DEEPSEEK_API_KEY="..."   # DeepSeek API

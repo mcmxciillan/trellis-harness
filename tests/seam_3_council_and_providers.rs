@@ -4,7 +4,8 @@ use exo_suit::{
     providers::{
         AgyParsedEvent, AgyStreamOutcome, build_provider_registry, detect_binary,
         evaluate_jev_decision_gate, map_provider_to_agy_model, parse_agy_stream_json_line,
-        resolve_api_model_name, run_agy_streaming_turn, sanitize_prob,
+        parse_muse_stream_json_line, resolve_api_model_name, run_agy_streaming_turn,
+        run_muse_streaming_turn, sanitize_prob,
     },
 };
 use std::{collections::HashMap, sync::Arc};
@@ -492,6 +493,107 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"conv-spec02-99","s
     )
     .await;
     assert_eq!(aborted_outcome, AgyStreamOutcome::Aborted);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn seam3_muse_provider_registry_and_msp_jsonl_streaming_contract() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut keys = HashMap::new();
+    keys.insert("muse".to_string(), "LLM_1607358788850350_test".to_string());
+
+    let reg = build_provider_registry(&keys);
+    let muse = reg
+        .iter()
+        .find(|p| p.id == "muse")
+        .expect("Registry must include Meta Muse Code (muse)");
+    assert_eq!(muse.model_class, "GENERATIVE_SYSTEM_2");
+    assert_eq!(muse.default_model, "muse-spark-1.3");
+    assert!(muse.has_api_key);
+    assert!(muse.available_models.contains(&"muse-wonder-1.0".to_string()));
+    assert!(muse.available_models.contains(&"muse-spark-open".to_string()));
+    assert!(muse.available_models.contains(&"muse-glimmer".to_string()));
+
+    assert_eq!(resolve_api_model_name("muse", ""), "muse-spark-1.3");
+    assert_eq!(resolve_api_model_name("muse", "default"), "muse-spark-1.3");
+    assert_eq!(
+        resolve_api_model_name("muse", "muse-wonder-1.0"),
+        "muse-wonder-1.0"
+    );
+
+    // Verify MSP v1 JSONL parsing via both parse_muse_stream_json_line and parse_agy_stream_json_line
+    let msp_linked = r#"{"schema_version":1,"stream":{"kind":"session","id":"01a1a429-4b76-70d0-8310-326f7954be54"},"sequence":2,"payload_type":"session.run.linked","payload":{"kind":"session_run_linked"}}"#;
+    assert_eq!(
+        parse_muse_stream_json_line(msp_linked, "exo-suit"),
+        Some(AgyParsedEvent::Init {
+            conversation_id: "01a1a429-4b76-70d0-8310-326f7954be54".to_string()
+        })
+    );
+    assert_eq!(
+        parse_agy_stream_json_line(msp_linked, "exo-suit"),
+        Some(AgyParsedEvent::Init {
+            conversation_id: "01a1a429-4b76-70d0-8310-326f7954be54".to_string()
+        })
+    );
+
+    let msp_delta = r#"{"schema_version":1,"sequence":18,"payload_type":"run.output.delta","payload":{"kind":"run_output_delta","text":"Muse Spark 1.3 online."}}"#;
+    assert_eq!(
+        parse_muse_stream_json_line(msp_delta, "exo-suit"),
+        Some(AgyParsedEvent::TextDelta {
+            step_index: 18,
+            delta: "Muse Spark 1.3 online.".to_string(),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+        })
+    );
+
+    // Verify run_muse_streaming_turn against a mock muse executable
+    let tmp_dir = std::env::temp_dir().join(format!("trellis_mock_muse_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let muse_script = tmp_dir.join("mock_muse_ok.sh");
+    let script_body = r#"#!/bin/sh
+printf '{"schema_version":1,"stream":{"kind":"session","id":"muse-sess-01"},"sequence":1,"payload_type":"session.run.linked","payload":{"kind":"session_run_linked"}}\n'
+printf '{"schema_version":1,"sequence":2,"payload_type":"run.output.delta","payload":{"kind":"run_output_delta","text":"Muse Code headless turn complete."}}\n'
+printf '{"schema_version":1,"sequence":3,"payload_type":"run.usage","payload":{"kind":"run_usage","models":[{"model":"muse-spark-1.3","input_tokens":640,"cached_tokens":120,"output_tokens":36,"reasoning_tokens":18,"calls":1}]}}\n'
+printf '{"schema_version":1,"stream":{"kind":"session","id":"muse-sess-01"},"sequence":4,"payload_type":"run.terminal.completed","payload":{"kind":"run_terminal","terminal":"completed","text":"Muse Code headless turn complete.","reason":null}}\n'
+"#;
+    std::fs::write(&muse_script, script_body).expect("write mock_muse_ok.sh");
+    let mut perms = std::fs::metadata(&muse_script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&muse_script, perms).unwrap();
+
+    let (_abort_tx, mut abort_rx) = watch::channel(false);
+    let mut observed = Vec::new();
+    let outcome = run_muse_streaming_turn(
+        muse_script.to_str().unwrap(),
+        &tmp_dir,
+        "exo-suit",
+        "muse-spark-1.3",
+        Some("LLM_test_key"),
+        "Verify Muse Code MSP streaming",
+        &mut abort_rx,
+        |evt| observed.push(evt),
+    )
+    .await;
+
+    assert!(observed.len() >= 3);
+    match outcome {
+        AgyStreamOutcome::Completed {
+            text,
+            tokens,
+            interactive_questions,
+        } => {
+            assert_eq!(text, "Muse Code headless turn complete.");
+            assert_eq!(tokens.input_tokens, 640);
+            assert_eq!(tokens.output_tokens, 36);
+            assert_eq!(tokens.cache_read_tokens, 120);
+            assert!(interactive_questions.is_empty());
+        }
+        other => panic!("Expected AgyStreamOutcome::Completed, got {:?}", other),
+    }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

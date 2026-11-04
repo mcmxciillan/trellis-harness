@@ -4,6 +4,7 @@
   const PROVIDER_COLORS = {
     antigravity: "#A8202A", // Pomegranate Crimson
     jev: "#2D4A3E",         // Deep Laurel Green
+    muse: "#0064E0",        // Meta Royal Azure
     claude: "#9E472A",      // Burnt Umber
     codex: "#2D4A3E",       // Deep Laurel Green
     copilot: "#4A6B5D",     // Laurel Slate
@@ -20,7 +21,7 @@
     executionMode: "independent", // "independent" | "council"
     selectedProvider: "antigravity",
     selectedModel: "gemini-4-argon",
-    councilParticipants: new Set(["antigravity", "jev", "claude", "codex", "deepseek", "kimi"]),
+    councilParticipants: new Set(["antigravity", "jev", "muse", "claude", "codex", "deepseek", "kimi"]),
     providers: [],
     agents: [],
     selectedAgentId: null,
@@ -139,6 +140,7 @@
   keysForm.addEventListener("submit", () => {
     const api_keys = {
       jev: document.getElementById("key-jev")?.value.trim() || "",
+      muse: document.getElementById("key-muse")?.value.trim() || "",
       claude: document.getElementById("key-claude").value.trim(),
       codex: document.getElementById("key-codex").value.trim(),
       deepseek: document.getElementById("key-deepseek").value.trim(),
