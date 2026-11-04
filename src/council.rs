@@ -96,8 +96,83 @@ impl SharedAppState {
         }
     }
 
-    pub fn server_port(&self) -> u16 {
-        active_server_port()
+    pub fn resolve_and_bind_scope(
+        &mut self,
+        requested_session_id: Option<&str>,
+        requested_project_id: Option<&str>,
+    ) -> crate::models::ExecutionScope {
+        let eff_sess = requested_session_id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&self.active_session_id)
+            .to_string();
+        let eff_proj = requested_project_id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&self.active_project)
+            .to_string();
+        let scope = resolve_execution_scope(&eff_sess, &eff_proj);
+        save_session_project_id(&scope.session_id, &scope.project_id);
+        if scope.session_id == self.active_session_id {
+            self.active_project = scope.project_id.clone();
+        }
+        scope
+    }
+
+    pub fn broadcast_chat_stream(&self, tx: &broadcast::Sender<String>, session_id: &str) {
+        if self.active_session_id == session_id {
+            let _ = tx.send(
+                json!({
+                    "type": "CHAT_STREAM_UPDATE",
+                    "session_id": session_id,
+                    "active_session_id": session_id,
+                    "agents": self.agents,
+                    "chat_thread": self.chat_thread
+                })
+                .to_string(),
+            );
+        }
+    }
+
+    pub fn broadcast_agents_updated(&self, tx: &broadcast::Sender<String>, session_id: &str) {
+        if self.active_session_id == session_id {
+            let _ = tx.send(
+                json!({
+                    "type": "AGENTS_UPDATED",
+                    "session_id": session_id,
+                    "active_session_id": session_id,
+                    "agents": self.agents
+                })
+                .to_string(),
+            );
+        }
+    }
+
+    pub fn broadcast_council_updated(
+        &self,
+        tx: &broadcast::Sender<String>,
+        session_id: &str,
+        include_chat: bool,
+    ) {
+        if self.active_session_id == session_id {
+            let payload = if include_chat {
+                json!({
+                    "type": "COUNCIL_UPDATED",
+                    "session_id": session_id,
+                    "active_session_id": session_id,
+                    "council": self.council,
+                    "agents": self.agents,
+                    "chat_thread": self.chat_thread
+                })
+            } else {
+                json!({
+                    "type": "COUNCIL_UPDATED",
+                    "session_id": session_id,
+                    "active_session_id": session_id,
+                    "council": self.council,
+                    "agents": self.agents
+                })
+            };
+            let _ = tx.send(payload.to_string());
+        }
     }
 
     pub fn update_scoped_chat_message<F>(&mut self, session_id: &str, msg_id: &str, mut f: F) -> bool
@@ -123,33 +198,6 @@ impl SharedAppState {
             }
         }
         updated
-    }
-
-    pub fn switch_active_session(
-        &mut self,
-        session_id: &str,
-    ) -> (String, Vec<AgentNode>, Vec<ChatMessage>) {
-        let inferred_proj = infer_session_project_id(session_id);
-        self.active_session_id = session_id.to_string();
-        self.active_project = inferred_proj.clone();
-        self.council = None;
-        let merged_chat = self.load_merged_session_chat(session_id);
-        self.agents = build_live_session_graph(session_id, &inferred_proj);
-        (inferred_proj, self.agents.clone(), merged_chat)
-    }
-
-    pub fn switch_active_project(&mut self, project_id: &str) -> Vec<AgentNode> {
-        let proj = project_id
-            .trim_matches('/')
-            .split('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("exo-suit")
-            .to_string();
-        self.active_project = proj.clone();
-        save_session_project_id(&self.active_session_id, &proj);
-        self.agents = build_live_session_graph(&self.active_session_id, &proj);
-        self.agents.clone()
     }
 
     pub fn push_or_update_scoped_chat(&mut self, session_id: &str, msg: ChatMessage) {
@@ -317,17 +365,7 @@ async fn stream_text_into_chat_message(
                     }
                 }
             });
-            if st.active_session_id == session_id {
-                let _ = tx.send(
-                    json!({
-                        "type": "CHAT_STREAM_UPDATE",
-                        "session_id": session_id,
-                        "active_session_id": session_id,
-                        "chat_thread": st.chat_thread
-                    })
-                    .to_string(),
-                );
-            }
+            st.broadcast_chat_stream(tx, session_id);
         }
 
         if !is_done {
@@ -351,6 +389,46 @@ pub fn now_iso_short() -> String {
     format_epoch_secs(secs)
 }
 
+fn make_interactive_prompt(
+    node_id: &str,
+    step_index: u32,
+    questions: Vec<crate::models::InteractiveQuestionItem>,
+) -> Option<InteractivePrompt> {
+    if questions.is_empty() {
+        None
+    } else {
+        Some(InteractivePrompt {
+            prompt_id: format!("ask-{}", node_id),
+            step_index,
+            status: "Pending".to_string(),
+            questions,
+            answers: Vec::new(),
+        })
+    }
+}
+
+fn complete_tools_with_interactive(
+    tools: &mut Vec<ToolCall>,
+    interactive: Option<&InteractivePrompt>,
+) {
+    for tc in tools.iter_mut() {
+        tc.status = "Completed".to_string();
+    }
+    if let Some(ip) = interactive {
+        if !tools.iter().any(|t| t.name == "ask_question") {
+            tools.push(ToolCall {
+                name: "ask_question".to_string(),
+                summary: ip
+                    .questions
+                    .first()
+                    .map(|q| q.question.chars().take(68).collect())
+                    .unwrap_or_else(|| "Interactive question".to_string()),
+                status: "Completed".to_string(),
+            });
+        }
+    }
+}
+
 pub async fn run_independent_prompt(
     state: Arc<RwLock<SharedAppState>>,
     tx: broadcast::Sender<String>,
@@ -364,21 +442,10 @@ pub async fn run_independent_prompt(
 
     let (scope, api_keys, provider_info) = {
         let mut st = state.write().await;
-        let eff_sess = requested_session_id
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&st.active_session_id)
-            .to_string();
-        let eff_proj = requested_project_id
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&st.active_project)
-            .to_string();
-        let resolved_scope = resolve_execution_scope(&eff_sess, &eff_proj);
-        save_session_project_id(&resolved_scope.session_id, &resolved_scope.project_id);
-        if resolved_scope.session_id == st.active_session_id {
-            st.active_project = resolved_scope.project_id.clone();
-        }
+        let resolved_scope = st.resolve_and_bind_scope(
+            requested_session_id.as_deref(),
+            requested_project_id.as_deref(),
+        );
 
         let reg = build_provider_registry(&st.api_keys);
         let p_info = reg
@@ -703,18 +770,7 @@ pub async fn run_independent_prompt(
                                     m.tool_calls.push(tool_entry.clone());
                                 },
                             );
-                            if scope_for_evts.session_id == st.active_session_id {
-                                let _ = tx_for_evts.send(
-                                    json!({
-                                        "type": "CHAT_STREAM_UPDATE",
-                                        "session_id": scope_for_evts.session_id,
-                                        "active_session_id": scope_for_evts.session_id,
-                                        "agents": st.agents,
-                                        "chat_thread": st.chat_thread
-                                    })
-                                    .to_string(),
-                                );
-                            }
+                            st.broadcast_chat_stream(&tx_for_evts, &scope_for_evts.session_id);
                             saw_real_tool = true;
                         }
                         AgyParsedEvent::ToolDone { tool_name, .. } => {
@@ -749,18 +805,7 @@ pub async fn run_independent_prompt(
                                     }
                                 },
                             );
-                            if scope_for_evts.session_id == st.active_session_id {
-                                let _ = tx_for_evts.send(
-                                    json!({
-                                        "type": "CHAT_STREAM_UPDATE",
-                                        "session_id": scope_for_evts.session_id,
-                                        "active_session_id": scope_for_evts.session_id,
-                                        "agents": st.agents,
-                                        "chat_thread": st.chat_thread
-                                    })
-                                    .to_string(),
-                                );
-                            }
+                            st.broadcast_chat_stream(&tx_for_evts, &scope_for_evts.session_id);
                         }
                         AgyParsedEvent::TextDelta {
                             delta,
@@ -817,18 +862,7 @@ pub async fn run_independent_prompt(
                                     m.streaming = true;
                                 },
                             );
-                            if scope_for_evts.session_id == st.active_session_id {
-                                let _ = tx_for_evts.send(
-                                    json!({
-                                        "type": "CHAT_STREAM_UPDATE",
-                                        "session_id": scope_for_evts.session_id,
-                                        "active_session_id": scope_for_evts.session_id,
-                                        "agents": st.agents,
-                                        "chat_thread": st.chat_thread
-                                    })
-                                    .to_string(),
-                                );
-                            }
+                            st.broadcast_chat_stream(&tx_for_evts, &scope_for_evts.session_id);
                         }
                         AgyParsedEvent::Result { .. } => {
                             break;
@@ -886,17 +920,8 @@ pub async fn run_independent_prompt(
                     tokens: final_tokens,
                     interactive_questions,
                 } => {
-                    let reply_interactive = if !interactive_questions.is_empty() {
-                        Some(InteractivePrompt {
-                            prompt_id: format!("ask-{}", node_id),
-                            step_index: step_counter + 1,
-                            status: "Pending".to_string(),
-                            questions: interactive_questions,
-                            answers: Vec::new(),
-                        })
-                    } else {
-                        None
-                    };
+                    let reply_interactive =
+                        make_interactive_prompt(&node_id, step_counter + 1, interactive_questions);
 
                     let mut final_tools = Vec::new();
                     let mut final_thinking = None;
@@ -908,24 +933,10 @@ pub async fn run_independent_prompt(
                             if let Some(agent) =
                                 st.agents.iter_mut().find(|a| a.agent_id == node_id)
                             {
-                                for tc in &mut agent.tool_calls {
-                                    tc.status = "Completed".to_string();
-                                }
-                                if let Some(ref ip) = reply_interactive {
-                                    if !agent.tool_calls.iter().any(|t| t.name == "ask_question") {
-                                        agent.tool_calls.push(ToolCall {
-                                            name: "ask_question".to_string(),
-                                            summary: ip
-                                                .questions
-                                                .first()
-                                                .map(|q| q.question.chars().take(68).collect())
-                                                .unwrap_or_else(|| {
-                                                    "Interactive question".to_string()
-                                                }),
-                                            status: "Completed".to_string(),
-                                        });
-                                    }
-                                }
+                                complete_tools_with_interactive(
+                                    &mut agent.tool_calls,
+                                    reply_interactive.as_ref(),
+                                );
                                 final_tools = agent.tool_calls.clone();
                                 if !agent.thinking.is_empty() {
                                     final_thinking = Some(agent.thinking.clone());
@@ -961,22 +972,10 @@ pub async fn run_independent_prompt(
                         }
 
                         st.update_scoped_chat_message(&scope.session_id, &reply_id, |m| {
-                            for tc in &mut m.tool_calls {
-                                tc.status = "Completed".to_string();
-                            }
-                            if let Some(ref ip) = reply_interactive {
-                                if !m.tool_calls.iter().any(|t| t.name == "ask_question") {
-                                    m.tool_calls.push(ToolCall {
-                                        name: "ask_question".to_string(),
-                                        summary: ip
-                                            .questions
-                                            .first()
-                                            .map(|q| q.question.chars().take(68).collect())
-                                            .unwrap_or_else(|| "Interactive question".to_string()),
-                                        status: "Completed".to_string(),
-                                    });
-                                }
-                            }
+                            complete_tools_with_interactive(
+                                &mut m.tool_calls,
+                                reply_interactive.as_ref(),
+                            );
                             if !final_tools.is_empty() {
                                 m.tool_calls = final_tools.clone();
                             } else {
@@ -991,28 +990,8 @@ pub async fn run_independent_prompt(
                         });
 
                         st.active_runs.remove(&node_id);
-
-                        if scope.session_id == st.active_session_id {
-                            let _ = tx.send(
-                                json!({
-                                    "type": "CHAT_STREAM_UPDATE",
-                                    "session_id": scope.session_id,
-                                    "active_session_id": scope.session_id,
-                                    "agents": st.agents,
-                                    "chat_thread": st.chat_thread
-                                })
-                                .to_string(),
-                            );
-                            let _ = tx.send(
-                                json!({
-                                    "type": "AGENTS_UPDATED",
-                                    "session_id": scope.session_id,
-                                    "active_session_id": scope.session_id,
-                                    "agents": st.agents
-                                })
-                                .to_string(),
-                            );
-                        }
+                        st.broadcast_chat_stream(&tx, &scope.session_id);
+                        st.broadcast_agents_updated(&tx, &scope.session_id);
                         st.devops_tests.get(&scope.project_id).cloned()
                     };
 
@@ -1030,13 +1009,7 @@ pub async fn run_independent_prompt(
                         cached_test,
                         active_server_port(),
                     );
-                    let _ = tx.send(
-                        json!({
-                            "type": "DEVOPS_UPDATED",
-                            "devops": devops
-                        })
-                        .to_string(),
-                    );
+                    let _ = tx.send(json!({ "type": "DEVOPS_UPDATED", "devops": devops }).to_string());
                     return;
                 }
                 AgyStreamOutcome::CliError(_) => {}
@@ -1094,18 +1067,7 @@ pub async fn run_independent_prompt(
             }
             m.tool_calls.push(step2_tool.clone());
         });
-        if scope.session_id == st.active_session_id {
-            let _ = tx.send(
-                json!({
-                    "type": "CHAT_STREAM_UPDATE",
-                    "session_id": scope.session_id,
-                    "active_session_id": scope.session_id,
-                    "agents": st.agents,
-                    "chat_thread": st.chat_thread
-                })
-                .to_string(),
-            );
-        }
+        st.broadcast_chat_stream(&tx, &scope.session_id);
     }
 
     let res = tokio::select! {
@@ -1134,17 +1096,7 @@ pub async fn run_independent_prompt(
         cache_read_tokens: 900,
         output_tokens: (res.text.len() as u64 / 3).max(48),
     };
-    let reply_interactive = if !res.interactive_questions.is_empty() {
-        Some(InteractivePrompt {
-            prompt_id: format!("ask-{}", node_id),
-            step_index: 3,
-            status: "Pending".to_string(),
-            questions: res.interactive_questions,
-            answers: Vec::new(),
-        })
-    } else {
-        None
-    };
+    let reply_interactive = make_interactive_prompt(&node_id, 3, res.interactive_questions);
 
     {
         let mut st = state.write().await;
@@ -1184,20 +1136,7 @@ pub async fn run_independent_prompt(
                         .take(85)
                         .collect()
                 };
-                for tc in &mut agent.tool_calls {
-                    tc.status = "Completed".to_string();
-                }
-                if let Some(ref ip) = reply_interactive {
-                    agent.tool_calls.push(ToolCall {
-                        name: "ask_question".to_string(),
-                        summary: ip
-                            .questions
-                            .first()
-                            .map(|q| q.question.chars().take(68).collect())
-                            .unwrap_or_else(|| "Interactive question".to_string()),
-                        status: "Completed".to_string(),
-                    });
-                }
+                complete_tools_with_interactive(&mut agent.tool_calls, reply_interactive.as_ref());
                 reply_tools = agent.tool_calls.clone();
                 if !agent.thinking.is_empty() {
                     reply_thinking = Some(agent.thinking.clone());
@@ -1220,37 +1159,11 @@ pub async fn run_independent_prompt(
                     .collect();
             }
 
-            let _ = tx.send(
-                json!({
-                    "type": "AGENTS_UPDATED",
-                    "session_id": scope.session_id,
-                    "active_session_id": scope.session_id,
-                    "agents": st.agents
-                })
-                .to_string(),
-            );
+            st.broadcast_agents_updated(&tx, &scope.session_id);
         } else if let Some(msgs) = st.session_custom_messages.get(&scope.session_id) {
             if let Some(m) = msgs.iter().find(|m| m.id == reply_id) {
-                reply_tools = m
-                    .tool_calls
-                    .iter()
-                    .cloned()
-                    .map(|mut tc| {
-                        tc.status = "Completed".to_string();
-                        tc
-                    })
-                    .collect();
-                if let Some(ref ip) = reply_interactive {
-                    reply_tools.push(ToolCall {
-                        name: "ask_question".to_string(),
-                        summary: ip
-                            .questions
-                            .first()
-                            .map(|q| q.question.chars().take(68).collect())
-                            .unwrap_or_else(|| "Interactive question".to_string()),
-                        status: "Completed".to_string(),
-                    });
-                }
+                reply_tools = m.tool_calls.clone();
+                complete_tools_with_interactive(&mut reply_tools, reply_interactive.as_ref());
                 reply_thinking = m.thinking.clone();
             }
         }
@@ -1281,19 +1194,9 @@ pub async fn run_independent_prompt(
     {
         let mut st = state.write().await;
         st.active_runs.remove(&node_id);
-        // Once the subagent has finished streaming and is not waiting on an interactive question,
-        // remove the completed subagent node from the graph so only active subagents/tasks remain!
         if reply_interactive.is_none() && scope.session_id == st.active_session_id {
             st.agents.retain(|a| a.agent_id != node_id);
-            let _ = tx.send(
-                json!({
-                    "type": "AGENTS_UPDATED",
-                    "session_id": scope.session_id,
-                    "active_session_id": scope.session_id,
-                    "agents": st.agents
-                })
-                .to_string(),
-            );
+            st.broadcast_agents_updated(&tx, &scope.session_id);
         }
     }
 }
@@ -1483,21 +1386,10 @@ pub async fn run_council_session(
 
     let (scope, api_keys, provider_map) = {
         let mut st = state.write().await;
-        let eff_sess = requested_session_id
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&st.active_session_id)
-            .to_string();
-        let eff_proj = requested_project_id
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&st.active_project)
-            .to_string();
-        let resolved_scope = resolve_execution_scope(&eff_sess, &eff_proj);
-        save_session_project_id(&resolved_scope.session_id, &resolved_scope.project_id);
-        if resolved_scope.session_id == st.active_session_id {
-            st.active_project = resolved_scope.project_id.clone();
-        }
+        let resolved_scope = st.resolve_and_bind_scope(
+            requested_session_id.as_deref(),
+            requested_project_id.as_deref(),
+        );
 
         let reg = build_provider_registry(&st.api_keys);
         let p_map: HashMap<String, crate::models::ProviderInfo> =
@@ -1719,19 +1611,7 @@ pub async fn run_council_session(
             },
         );
 
-        if resolved_scope.session_id == st.active_session_id {
-            let _ = tx.send(
-                json!({
-                    "type": "COUNCIL_UPDATED",
-                    "session_id": resolved_scope.session_id,
-                    "active_session_id": resolved_scope.session_id,
-                    "council": session,
-                    "agents": st.agents,
-                    "chat_thread": st.chat_thread
-                })
-                .to_string(),
-            );
-        }
+        st.broadcast_council_updated(&tx, &resolved_scope.session_id, true);
 
         (resolved_scope, st.api_keys.clone(), p_map)
     };
@@ -1866,17 +1746,7 @@ pub async fn run_council_session(
                 c.proposals = proposals.clone();
                 c.jev_gate_summary = Some(jev_gate_eval.clone());
             }
-
-            let _ = tx.send(
-                json!({
-                    "type": "COUNCIL_UPDATED",
-                    "session_id": scope.session_id,
-                    "active_session_id": scope.session_id,
-                    "council": st.council,
-                    "agents": st.agents
-                })
-                .to_string(),
-            );
+            st.broadcast_council_updated(&tx, &scope.session_id, false);
         }
     }
 
@@ -1946,17 +1816,7 @@ pub async fn run_council_session(
                 c.stage_number = 3;
                 c.proposals = proposals.clone();
             }
-
-            let _ = tx.send(
-                json!({
-                    "type": "COUNCIL_UPDATED",
-                    "session_id": scope.session_id,
-                    "active_session_id": scope.session_id,
-                    "council": st.council,
-                    "agents": st.agents
-                })
-                .to_string(),
-            );
+            st.broadcast_council_updated(&tx, &scope.session_id, false);
         }
     }
 
@@ -2246,19 +2106,7 @@ pub async fn run_council_session(
             },
         );
 
-        if scope.session_id == st.active_session_id {
-            let _ = tx.send(
-                json!({
-                    "type": "COUNCIL_UPDATED",
-                    "session_id": scope.session_id,
-                    "active_session_id": scope.session_id,
-                    "council": st.council,
-                    "agents": st.agents,
-                    "chat_thread": st.chat_thread
-                })
-                .to_string(),
-            );
-        }
+        st.broadcast_council_updated(&tx, &scope.session_id, true);
     }
 
     let council_msg_id = format!("council-win-{}", council_id);
@@ -2286,6 +2134,64 @@ mod tests {
     use super::*;
     use crate::brain::{code_root_dir, extract_project_slug_from_text, resolve_execution_scope};
 
+    fn test_state(active_session_id: &str, agents: Vec<AgentNode>) -> SharedAppState {
+        SharedAppState {
+            agents,
+            council: None,
+            active_project: "exo-suit".to_string(),
+            active_session_id: active_session_id.to_string(),
+            chat_thread: Vec::new(),
+            custom_chat_messages: Vec::new(),
+            session_custom_messages: HashMap::new(),
+            active_runs: HashMap::new(),
+            devops_tests: HashMap::new(),
+            api_keys: HashMap::new(),
+        }
+    }
+
+    fn test_msg(id: &str, step_index: u32, content: &str, streaming: bool, tool_calls: Vec<ToolCall>) -> ChatMessage {
+        ChatMessage {
+            id: id.to_string(),
+            step_index,
+            role: "assistant".to_string(),
+            sender: "Claude".to_string(),
+            provider: "claude".to_string(),
+            model: "claude-sonnet-4.5".to_string(),
+            timestamp: "12:00:00".to_string(),
+            content: content.to_string(),
+            thinking: None,
+            tool_calls,
+            streaming,
+            interactive_prompt: None,
+        }
+    }
+
+    fn test_node(agent_id: &str, parent_id: &str, node_kind: &str) -> AgentNode {
+        AgentNode {
+            agent_id: agent_id.to_string(),
+            parent_id: parent_id.to_string(),
+            node_kind: node_kind.to_string(),
+            provider: "claude".to_string(),
+            model: "claude-sonnet-4.5".to_string(),
+            role: "Claude Agent".to_string(),
+            status: "Running".to_string(),
+            execution_step: 1,
+            prompt: "Test".to_string(),
+            thinking: String::new(),
+            context: String::new(),
+            recent_log: String::new(),
+            tokens: TokenMetrics::default(),
+            tool_calls: vec![],
+            outputs: vec![],
+            x: 100.0,
+            y: 100.0,
+            council_score: None,
+            is_council_winner: false,
+            decision_eval: None,
+            interactive_prompt: None,
+        }
+    }
+
     #[test]
     fn anchor_test_monotonic_run_id_and_server_port() {
         let id1 = next_monotonic_run_id("claude");
@@ -2301,53 +2207,9 @@ mod tests {
 
     #[test]
     fn anchor_test_update_scoped_chat_message_synchronizes_all_three_vectors_only_when_active() {
-        let mut state = SharedAppState {
-            agents: Vec::new(),
-            council: None,
-            active_project: "exo-suit".to_string(),
-            active_session_id: "session-active".to_string(),
-            chat_thread: Vec::new(),
-            custom_chat_messages: Vec::new(),
-            session_custom_messages: HashMap::new(),
-            active_runs: HashMap::new(),
-            devops_tests: HashMap::new(),
-            api_keys: HashMap::new(),
-        };
-
-        state.push_or_update_scoped_chat(
-            "session-active",
-            ChatMessage {
-                id: "msg-1".to_string(),
-                step_index: 1,
-                role: "assistant".to_string(),
-                sender: "Claude".to_string(),
-                provider: "claude".to_string(),
-                model: "claude-4-sonnet".to_string(),
-                timestamp: "12:00:00".to_string(),
-                content: "Initial".to_string(),
-                thinking: None,
-                tool_calls: Vec::new(),
-                streaming: true,
-                interactive_prompt: None,
-            },
-        );
-        state.push_or_update_scoped_chat(
-            "session-bg",
-            ChatMessage {
-                id: "msg-bg".to_string(),
-                step_index: 1,
-                role: "assistant".to_string(),
-                sender: "Claude".to_string(),
-                provider: "claude".to_string(),
-                model: "claude-4-sonnet".to_string(),
-                timestamp: "12:00:00".to_string(),
-                content: "Bg Initial".to_string(),
-                thinking: None,
-                tool_calls: Vec::new(),
-                streaming: true,
-                interactive_prompt: None,
-            },
-        );
+        let mut state = test_state("session-active", Vec::new());
+        state.push_or_update_scoped_chat("session-active", test_msg("msg-1", 1, "Initial", true, Vec::new()));
+        state.push_or_update_scoped_chat("session-bg", test_msg("msg-bg", 1, "Bg Initial", true, Vec::new()));
 
         assert!(state.update_scoped_chat_message("session-active", "msg-1", |m| {
             m.content = "Updated Active".to_string();
@@ -2356,10 +2218,7 @@ mod tests {
         assert_eq!(state.chat_thread[0].content, "Updated Active");
         assert!(!state.chat_thread[0].streaming);
         assert_eq!(state.custom_chat_messages[0].content, "Updated Active");
-        assert_eq!(
-            state.session_custom_messages["session-active"][0].content,
-            "Updated Active"
-        );
+        assert_eq!(state.session_custom_messages["session-active"][0].content, "Updated Active");
 
         assert!(state.update_scoped_chat_message("session-bg", "msg-bg", |m| {
             m.content = "Updated Bg".to_string();
@@ -2367,10 +2226,7 @@ mod tests {
         }));
         assert_eq!(state.chat_thread.len(), 1);
         assert_eq!(state.chat_thread[0].content, "Updated Active");
-        assert_eq!(
-            state.session_custom_messages["session-bg"][0].content,
-            "Updated Bg"
-        );
+        assert_eq!(state.session_custom_messages["session-bg"][0].content, "Updated Bg");
     }
 
     #[test]
@@ -2379,10 +2235,7 @@ mod tests {
             "Reading {}/other-repo/src/lib.rs for workspace analysis",
             code_root_dir().display()
         );
-        assert_eq!(
-            extract_project_slug_from_text(&sample),
-            Some("other-repo".to_string())
-        );
+        assert_eq!(extract_project_slug_from_text(&sample), Some("other-repo".to_string()));
 
         let scope = resolve_execution_scope("session-beta", "exo-suit");
         assert_eq!(scope.session_id, "session-beta");
@@ -2392,132 +2245,43 @@ mod tests {
 
     #[test]
     fn anchor_test_cross_session_isolation_zero_bleed() {
-        let mut state = SharedAppState {
-            agents: Vec::new(),
-            council: None,
-            active_project: "exo-suit".to_string(),
-            active_session_id: "session-b".to_string(),
-            chat_thread: Vec::new(),
-            custom_chat_messages: Vec::new(),
-            session_custom_messages: HashMap::new(),
-            active_runs: HashMap::new(),
-            devops_tests: HashMap::new(),
-            api_keys: HashMap::new(),
-        };
+        let mut state = test_state("session-b", Vec::new());
 
         // Session A pushes a message while Session B is active in the UI
         state.push_or_update_scoped_chat(
             "session-a",
-            ChatMessage {
-                id: "reply-a1".to_string(),
-                step_index: 1,
-                role: "assistant".to_string(),
-                sender: "Claude".to_string(),
-                provider: "claude".to_string(),
-                model: "claude-sonnet-4.5".to_string(),
-                timestamp: "12:00:00".to_string(),
-                content: "Output scoped strictly to session-a".to_string(),
-                thinking: None,
-                tool_calls: Vec::new(),
-                streaming: false,
-                interactive_prompt: None,
-            },
+            test_msg("reply-a1", 1, "Output scoped strictly to session-a", false, Vec::new()),
         );
 
         // Session B's live chat_thread MUST have zero bleed from Session A
         assert!(state.chat_thread.is_empty());
-        assert_eq!(
-            state
-                .session_custom_messages
-                .get("session-a")
-                .map(|v| v.len()),
-            Some(1)
-        );
+        assert_eq!(state.session_custom_messages.get("session-a").map(|v| v.len()), Some(1));
     }
 
     #[test]
     fn anchor_test_hard_cancellation_aborts_run_and_cleans_nodes() {
         let (abort_tx, abort_rx) = watch::channel(false);
-        let mut state = SharedAppState {
-            agents: vec![
-                AgentNode {
-                    agent_id: "claude-99".to_string(),
-                    parent_id: "root".to_string(),
-                    node_kind: "subagent".to_string(),
-                    provider: "claude".to_string(),
-                    model: "claude-sonnet-4.5".to_string(),
-                    role: "Claude Agent".to_string(),
-                    status: "Running".to_string(),
-                    execution_step: 1,
-                    prompt: "Test".to_string(),
-                    thinking: String::new(),
-                    context: String::new(),
-                    recent_log: String::new(),
-                    tokens: TokenMetrics::default(),
-                    tool_calls: vec![],
-                    outputs: vec![],
-                    x: 100.0,
-                    y: 100.0,
-                    council_score: None,
-                    is_council_winner: false,
-                    decision_eval: None,
-                    interactive_prompt: None,
-                },
-                AgentNode {
-                    agent_id: "task-claude-99".to_string(),
-                    parent_id: "claude-99".to_string(),
-                    node_kind: "task".to_string(),
-                    provider: "claude".to_string(),
-                    model: "TASK • edit_file".to_string(),
-                    role: "Editing".to_string(),
-                    status: "Running".to_string(),
-                    execution_step: 1,
-                    prompt: "Test".to_string(),
-                    thinking: String::new(),
-                    context: String::new(),
-                    recent_log: String::new(),
-                    tokens: TokenMetrics::default(),
-                    tool_calls: vec![],
-                    outputs: vec![],
-                    x: 100.0,
-                    y: 255.0,
-                    council_score: None,
-                    is_council_winner: false,
-                    decision_eval: None,
-                    interactive_prompt: None,
-                },
+        let mut state = test_state(
+            "session-a",
+            vec![
+                test_node("claude-99", "root", "subagent"),
+                test_node("task-claude-99", "claude-99", "task"),
             ],
-            council: None,
-            active_project: "exo-suit".to_string(),
-            active_session_id: "session-a".to_string(),
-            chat_thread: Vec::new(),
-            custom_chat_messages: Vec::new(),
-            session_custom_messages: HashMap::new(),
-            active_runs: HashMap::new(),
-            devops_tests: HashMap::new(),
-            api_keys: HashMap::new(),
-        };
+        );
 
         state.push_or_update_scoped_chat(
             "session-a",
-            ChatMessage {
-                id: "reply-claude-99".to_string(),
-                step_index: 2,
-                role: "assistant".to_string(),
-                sender: "Claude".to_string(),
-                provider: "claude".to_string(),
-                model: "claude-sonnet-4.5".to_string(),
-                timestamp: "12:00:01".to_string(),
-                content: "Partial output".to_string(),
-                thinking: None,
-                tool_calls: vec![ToolCall {
+            test_msg(
+                "reply-claude-99",
+                2,
+                "Partial output",
+                true,
+                vec![ToolCall {
                     name: "edit_file".to_string(),
                     summary: "src/main.rs".to_string(),
                     status: "Running".to_string(),
                 }],
-                streaming: true,
-                interactive_prompt: None,
-            },
+            ),
         );
 
         state.active_runs.insert(

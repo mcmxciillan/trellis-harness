@@ -10,11 +10,9 @@
 
   /* Weathered Trellis Borders & Ambient Shadows */
   --trellis-mid: #7D796F;
-  --lattice-hairline: rgba(125, 121, 111, 0.20);
   --border: #DED9CC;
   --border-strong: #C5BEB0;
   --border-subtle: #E7E3D7;
-  --border-bright: #A8202A;
   --shadow-soft: 0 8px 24px -4px rgba(38, 36, 32, 0.06), 0 2px 6px -1px rgba(38, 36, 32, 0.04);
   --shadow-float: 0 14px 34px -6px rgba(38, 36, 32, 0.11), 0 4px 10px -2px rgba(38, 36, 32, 0.05);
 
@@ -24,18 +22,13 @@
   --text-faint: #989388;
 
   /* Core Brand Accents: Pomegranate Crimson, Deep Laurel Green, Laurel Slate, Burnt Umber */
-  --pomegranate: #A8202A;
   --terracotta: #A8202A;
   --terracotta-strong: #87161F;
   --terracotta-tint: rgba(168, 32, 42, 0.11);
 
-  --laurel: #2D4A3E;
   --moss: #2D4A3E;
   --moss-strong: #1F352C;
   --moss-tint: rgba(45, 74, 62, 0.12);
-
-  --laurel-slate: #4A6B5D;
-  --burnt-umber: #9E472A;
 
   --ochre: #9E472A;
   --ochre-tint: rgba(158, 71, 42, 0.13);
@@ -43,21 +36,8 @@
   --plum: #4A6B5D;
   --plum-tint: rgba(74, 107, 93, 0.13);
 
-  --clay-rose: #A8202A;
-  --clay-rose-tint: rgba(168, 32, 42, 0.13);
-
-  /* Semantic aliases */
-  --cyan: #A8202A;
-  --emerald: #2D4A3E;
-  --amber: #9E472A;
-  --coral: #A8202A;
-  --violet: #4A6B5D;
-  --rose: #A8202A;
-  --gold: #9E472A;
-
   --font-display: "Space Grotesk", "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --font-serif: "Space Grotesk", "Plus Jakarta Sans", sans-serif;
   --font-mono: "JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas, monospace;
 }
 
@@ -272,23 +252,6 @@ html, body {
   scrollbar-width: none;
 }
 
-.pill-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 11px;
-  border-radius: 999px;
-  background: var(--bg-well);
-  border: 1px solid var(--border);
-  font-size: 12px;
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-
-.pill-badge strong {
-  color: var(--terracotta-strong);
-}
-
 .session-selector-group {
   display: inline-flex;
   align-items: center;
@@ -405,7 +368,6 @@ html, body {
   left: 14px;
   display: flex;
   flex-wrap: wrap;
-  flex-wrap: balance;
   gap: 8px;
   pointer-events: none;
 }
@@ -823,20 +785,6 @@ html, body {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg-panel);
-}
-
-/* Loading & Streaming Answer Indicators */
-.chat-streaming-indicator {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border-radius: 8px;
-  background: var(--terracotta-tint);
-  border: 1px solid rgba(168, 32, 42, 0.28);
-  color: var(--terracotta-strong);
-  font-size: 11.5px;
-  font-weight: 700;
 }
 
 /* In-Place Transient Active Task Indicator (Appears while working, disappears when complete) */
@@ -1315,7 +1263,6 @@ html, body {
   display: flex;
   align-items: safe center;
   flex-wrap: wrap;
-  flex-wrap: balance;
   gap: 6px;
 }
 
@@ -1625,7 +1572,6 @@ dialog::backdrop {
 .skills-source-pills {
   display: flex;
   flex-wrap: wrap;
-  flex-wrap: balance;
   gap: 5px;
   max-block-size: 62px;
   overflow-y: auto;
@@ -2057,9 +2003,10 @@ dialog::backdrop {
 }
 
 /* ==========================================================================
-   Main Window Document, Artifact & Code Viewer Overlay
+   Main Window Document, Artifact, Code Viewer & DevOps Overlays
    ========================================================================== */
-.main-file-viewer-overlay {
+.main-file-viewer-overlay,
+.main-devops-overlay {
   position: absolute;
   inset: 0;
   z-index: 22;
@@ -2071,14 +2018,19 @@ dialog::backdrop {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  animation: fadeInMainOverlay 0.2s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-.main-file-viewer-overlay.hidden {
+.main-devops-overlay {
+  z-index: 23;
+}
+
+.main-file-viewer-overlay.hidden,
+.main-devops-overlay.hidden {
   display: none;
 }
 
-.main-file-viewer-container {
+.main-file-viewer-container,
+.main-devops-container {
   flex: 1;
   min-block-size: 0;
   display: flex;
@@ -2086,7 +2038,8 @@ dialog::backdrop {
   overflow: hidden;
 }
 
-.file-viewer-toolbar {
+.file-viewer-toolbar,
+.devops-toolbar {
   flex-shrink: 0;
   display: flex;
   align-items: center;
@@ -2599,47 +2552,6 @@ dialog::backdrop {
 }
 
 /* Main Screen DevOps, Git Diff, Anchor Test & Deploy Workbench */
-.main-devops-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 23;
-  background: var(--bg-canvas);
-  background-image:
-    linear-gradient(to right, rgba(125, 121, 111, 0.14) 0.5px, transparent 0.5px),
-    linear-gradient(to bottom, rgba(125, 121, 111, 0.14) 0.5px, transparent 0.5px);
-  background-size: 32px 32px;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  animation: fadeInMainOverlay 0.2s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.main-devops-overlay.hidden {
-  display: none;
-}
-
-.main-devops-container {
-  flex: 1;
-  min-block-size: 0;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.devops-toolbar {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding: 12px 20px;
-  background: var(--bg-panel);
-  border-bottom: 1.5px solid var(--border);
-  box-shadow: 0 4px 16px -6px rgba(38, 36, 32, 0.08);
-  z-index: 3;
-}
-
 .devops-workbench-body {
   flex: 1;
   min-block-size: 0;
@@ -2845,13 +2757,6 @@ dialog::backdrop {
   align-items: center;
   gap: 4px;
   transition: all 0.14s ease;
-}
-
-.lifecycle-chip code {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--terracotta-strong);
-  font-weight: 700;
 }
 
 .lifecycle-chip:hover {

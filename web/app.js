@@ -92,7 +92,6 @@
   const ctx = canvas.getContext("2d", { alpha: false });
   const graphViewport = document.getElementById("graph-viewport");
   const connBadge = document.getElementById("conn-badge");
-  const activeProjectLabel = document.getElementById("active-project-label");
   const activeProjectBadge = document.getElementById("active-project-badge");
   const sessionSelect = document.getElementById("session-select");
   const renameSessionBtn = document.getElementById("rename-session-btn");
@@ -100,14 +99,11 @@
   const sessionRenameInput = document.getElementById("session-rename-input");
   const sessionRenameSaveBtn = document.getElementById("session-rename-save");
   const sessionRenameCancelBtn = document.getElementById("session-rename-cancel");
-  const agentCountLabel = document.getElementById("agent-count-label");
   const councilStageBanner = document.getElementById("council-stage-banner");
   const councilBannerText = document.getElementById("council-banner-text");
   const inspectorDrawer = document.getElementById("inspector-drawer");
   const drawerHandle = document.getElementById("drawer-handle");
   const atelierLeftRail = document.getElementById("atelier-left-rail");
-  const toggleLeftDrawerBtn = document.getElementById("toggle-left-drawer-btn");
-  const toggleRightDrawerBtn = document.getElementById("toggle-right-drawer-btn");
   const reopenLeftBtn = document.getElementById("reopen-left-btn");
   const reopenRightBtn = document.getElementById("reopen-right-btn");
   const collapseRightBtn = document.getElementById("collapse-right-btn");
@@ -127,49 +123,42 @@
   const closeKeysBtn = document.getElementById("close-keys-btn");
   const keysForm = document.getElementById("keys-form");
 
-  // =========================================================================
-  // 1. Modern Web Guidance: Light-Dismiss Dialog + Content-Visibility Pause
-  // =========================================================================
-  openKeysBtn.addEventListener("click", () => {
-    keysDialog.showModal();
-  });
+  function saveSessionAliases() {
+    try {
+      localStorage.setItem("trellis.sessionAliases.v1", JSON.stringify(state.sessionAliases));
+    } catch {
+      // ignore storage quota errors
+    }
+  }
 
-  closeKeysBtn.addEventListener("click", () => {
-    keysDialog.close();
-  });
-
-  if (!("closedBy" in HTMLDialogElement.prototype)) {
-    keysDialog.addEventListener("click", (event) => {
-      if (event.target !== keysDialog) return;
-      const rect = keysDialog.getBoundingClientRect();
-      const isDialogContent =
+  function bindDialogLightDismiss(dlg) {
+    if (!dlg || "closedBy" in HTMLDialogElement.prototype) return;
+    dlg.addEventListener("click", (event) => {
+      if (event.target !== dlg) return;
+      const rect = dlg.getBoundingClientRect();
+      const inside =
         rect.top <= event.clientY &&
         event.clientY <= rect.top + rect.height &&
         rect.left <= event.clientX &&
         event.clientX <= rect.left + rect.width;
-      if (isDialogContent) return;
-      keysDialog.close();
+      if (!inside) dlg.close();
     });
   }
 
+  // =========================================================================
+  // 1. Modern Web Guidance: Light-Dismiss Dialog + Content-Visibility Pause
+  // =========================================================================
+  openKeysBtn.addEventListener("click", () => keysDialog.showModal());
+  closeKeysBtn.addEventListener("click", () => keysDialog.close());
+  bindDialogLightDismiss(keysDialog);
+
   keysForm.addEventListener("submit", () => {
-    const api_keys = {
-      jev: document.getElementById("key-jev")?.value.trim() || "",
-      gemini: document.getElementById("key-gemini")?.value.trim() || "",
-      muse: document.getElementById("key-muse")?.value.trim() || "",
-      claude: document.getElementById("key-claude")?.value.trim() || "",
-      codex: document.getElementById("key-codex")?.value.trim() || "",
-      copilot: document.getElementById("key-copilot")?.value.trim() || "",
-      cursor: document.getElementById("key-cursor")?.value.trim() || "",
-      amp: document.getElementById("key-amp")?.value.trim() || "",
-      droid: document.getElementById("key-droid")?.value.trim() || "",
-      qwen: document.getElementById("key-qwen")?.value.trim() || "",
-      deepseek: document.getElementById("key-deepseek")?.value.trim() || "",
-      kimi: document.getElementById("key-kimi")?.value.trim() || "",
-      grok: document.getElementById("key-grok")?.value.trim() || "",
-      mistral: document.getElementById("key-mistral")?.value.trim() || "",
-      openrouter: document.getElementById("key-openrouter")?.value.trim() || "",
-    };
+    const api_keys = Object.fromEntries(
+      Array.from(keysForm.querySelectorAll('input[id^="key-"]'), (el) => [
+        el.id.slice(4),
+        el.value.trim(),
+      ])
+    );
     sendCommand({ command: "SET_API_KEYS", api_keys });
   });
 
@@ -255,9 +244,6 @@
   }
 
   function syncActiveProjectUI() {
-    if (activeProjectLabel) {
-      activeProjectLabel.textContent = state.activeProject;
-    }
     if (activeProjectBadge) {
       activeProjectBadge.textContent = `📂 ~/code/${state.activeProject}`;
       activeProjectBadge.title = `Active Workspace: ~/code/${state.activeProject} — Click to switch project directory in Files`;
@@ -390,14 +376,7 @@
       }
       if (pkt.provision && pkt.provision.session_id && pkt.provision.title) {
         state.sessionAliases[pkt.provision.session_id] = pkt.provision.title;
-        try {
-          localStorage.setItem(
-            "trellis.sessionAliases.v1",
-            JSON.stringify(state.sessionAliases)
-          );
-        } catch {
-          // ignore storage quota errors
-        }
+        saveSessionAliases();
       }
       renderSessionsDropdown();
       switchTab("chat");
@@ -415,10 +394,6 @@
       if (pkt.skills) state.skills = pkt.skills;
       if (pkt.tools) state.tools = pkt.tools;
       const totalCap = state.skills.length + state.tools.length;
-      const stBtn = document.getElementById("tab-btn-skills-tools");
-      if (stBtn) {
-        stBtn.textContent = `🧰 SKILLS & TOOLS (${totalCap})`;
-      }
       const topStBtn = document.getElementById("top-skills-tools-btn");
       if (topStBtn) {
         topStBtn.textContent = `🧰 Skills & Tools (${totalCap})`;
@@ -448,7 +423,6 @@
 
     if (pkt.agents) {
       state.agents = pkt.agents;
-      if (agentCountLabel) agentCountLabel.textContent = String(state.agents.length);
       if (connBadge && state.connected) {
         connBadge.title = `ONLINE • ${location.host} • Scaffold: ${state.activeProject} • ${state.agents.length} agents`;
       }
@@ -515,133 +489,41 @@
 
   function setLeftDrawerOpen(open) {
     state.leftDrawerOpen = open;
-    if (appShell) {
-      appShell.classList.toggle("left-collapsed", !open);
-    }
-    if (atelierLeftRail) {
-      atelierLeftRail.classList.toggle("collapsed", !open);
-    }
-    if (toggleLeftDrawerBtn) {
-      toggleLeftDrawerBtn.classList.toggle("drawer-toggle-active", open);
-    }
-    if (reopenLeftBtn) {
-      reopenLeftBtn.classList.toggle("hidden", open);
-    }
+    appShell?.classList.toggle("left-collapsed", !open);
+    atelierLeftRail?.classList.toggle("collapsed", !open);
+    reopenLeftBtn?.classList.toggle("hidden", open);
     requestAnimationFrame(resizeCanvas);
   }
 
   function setRightDrawerOpen(open) {
     state.rightDrawerOpen = open;
-    if (appShell) {
-      appShell.classList.toggle("right-collapsed", !open);
-    }
-    if (inspectorDrawer) {
-      inspectorDrawer.classList.toggle("collapsed", !open);
-    }
-    if (toggleRightDrawerBtn) {
-      toggleRightDrawerBtn.classList.toggle("drawer-toggle-active", open);
-    }
-    if (reopenRightBtn) {
-      reopenRightBtn.classList.toggle("hidden", open);
-    }
+    appShell?.classList.toggle("right-collapsed", !open);
+    inspectorDrawer?.classList.toggle("collapsed", !open);
+    reopenRightBtn?.classList.toggle("hidden", open);
     requestAnimationFrame(resizeCanvas);
   }
 
-  toggleLeftDrawerBtn?.addEventListener("click", () => {
-    setLeftDrawerOpen(!state.leftDrawerOpen);
-  });
+  reopenLeftBtn?.addEventListener("click", () => setLeftDrawerOpen(true));
+  reopenRightBtn?.addEventListener("click", () => setRightDrawerOpen(true));
+  collapseRightBtn?.addEventListener("click", () => setRightDrawerOpen(false));
 
-  reopenLeftBtn?.addEventListener("click", () => {
-    setLeftDrawerOpen(true);
-  });
+  function setActiveMainOverlay(overlay = null, devopsTab = null) {
+    if (devopsTab) state.devopsActiveTab = devopsTab;
+    state.skillsToolsMainOpen = overlay === "skills-tools";
+    state.fileViewerMainOpen = overlay === "file-viewer";
+    state.devopsMainOpen = overlay === "devops";
 
-  toggleRightDrawerBtn?.addEventListener("click", () => {
-    setRightDrawerOpen(!state.rightDrawerOpen);
-  });
-
-  reopenRightBtn?.addEventListener("click", () => {
-    setRightDrawerOpen(true);
-  });
-
-  collapseRightBtn?.addEventListener("click", () => {
-    setRightDrawerOpen(false);
-  });
-
-  function setSkillsToolsMainOpen(open) {
-    state.skillsToolsMainOpen = Boolean(open);
-    const overlay = document.getElementById("main-skills-tools-overlay");
-    if (overlay) {
-      overlay.classList.toggle("hidden", !state.skillsToolsMainOpen);
-    }
-    const topStBtn = document.getElementById("top-skills-tools-btn");
-    if (topStBtn) {
-      topStBtn.classList.toggle("drawer-toggle-active", state.skillsToolsMainOpen);
-    }
-    const tabStBtn = document.getElementById("tab-btn-skills-tools");
-    if (tabStBtn) {
-      tabStBtn.classList.toggle("active", state.skillsToolsMainOpen);
-    }
-    if (state.skillsToolsMainOpen) {
-      if (state.fileViewerMainOpen) {
-        state.fileViewerMainOpen = false;
-        document.getElementById("main-file-viewer-overlay")?.classList.add("hidden");
-      }
-      if (state.devopsMainOpen) {
-        state.devopsMainOpen = false;
-        document.getElementById("main-devops-overlay")?.classList.add("hidden");
-        renderTopbarDevOpsStrip();
-      }
-      renderSkillsToolsTab();
-    } else {
-      requestDraw();
-    }
-  }
-
-  function setFileViewerMainOpen(open) {
-    state.fileViewerMainOpen = Boolean(open);
-    const overlay = document.getElementById("main-file-viewer-overlay");
-    if (overlay) {
-      overlay.classList.toggle("hidden", !state.fileViewerMainOpen);
-    }
-    if (state.fileViewerMainOpen) {
-      if (state.skillsToolsMainOpen) {
-        state.skillsToolsMainOpen = false;
-        document.getElementById("main-skills-tools-overlay")?.classList.add("hidden");
-        document.getElementById("top-skills-tools-btn")?.classList.remove("drawer-toggle-active");
-        document.getElementById("tab-btn-skills-tools")?.classList.remove("active");
-      }
-      if (state.devopsMainOpen) {
-        state.devopsMainOpen = false;
-        document.getElementById("main-devops-overlay")?.classList.add("hidden");
-        renderTopbarDevOpsStrip();
-      }
-      renderMainFileViewer();
-    } else {
-      requestDraw();
-    }
-  }
-
-  function setDevOpsMainOpen(open, tab = null) {
-    if (tab) {
-      state.devopsActiveTab = tab;
-    }
-    state.devopsMainOpen = Boolean(open);
-    const overlay = document.getElementById("main-devops-overlay");
-    if (overlay) {
-      overlay.classList.toggle("hidden", !state.devopsMainOpen);
-    }
+    document.getElementById("main-skills-tools-overlay")?.classList.toggle("hidden", !state.skillsToolsMainOpen);
+    document.getElementById("top-skills-tools-btn")?.classList.toggle("drawer-toggle-active", state.skillsToolsMainOpen);
+    document.getElementById("main-file-viewer-overlay")?.classList.toggle("hidden", !state.fileViewerMainOpen);
+    document.getElementById("main-devops-overlay")?.classList.toggle("hidden", !state.devopsMainOpen);
     renderTopbarDevOpsStrip();
-    if (state.devopsMainOpen) {
-      if (state.skillsToolsMainOpen) {
-        state.skillsToolsMainOpen = false;
-        document.getElementById("main-skills-tools-overlay")?.classList.add("hidden");
-        document.getElementById("top-skills-tools-btn")?.classList.remove("drawer-toggle-active");
-        document.getElementById("tab-btn-skills-tools")?.classList.remove("active");
-      }
-      if (state.fileViewerMainOpen) {
-        state.fileViewerMainOpen = false;
-        document.getElementById("main-file-viewer-overlay")?.classList.add("hidden");
-      }
+
+    if (state.skillsToolsMainOpen) {
+      renderSkillsToolsTab();
+    } else if (state.fileViewerMainOpen) {
+      renderMainFileViewer();
+    } else if (state.devopsMainOpen) {
       renderMainDevOpsWorkbench();
       sendCommand({
         command: "OPEN_GIT_DIFF",
@@ -652,6 +534,10 @@
       requestDraw();
     }
   }
+
+  const setSkillsToolsMainOpen = (open) => setActiveMainOverlay(open ? "skills-tools" : null);
+  const setFileViewerMainOpen = (open) => setActiveMainOverlay(open ? "file-viewer" : null);
+  const setDevOpsMainOpen = (open, tab = null) => setActiveMainOverlay(open ? "devops" : null, tab);
 
   function openFileOnMainScreen(rawPath, explicitAnchor = "") {
     if (!rawPath) return;
@@ -709,12 +595,8 @@
         slashPop.classList.add("hidden");
         return;
       }
-      if (state.devopsMainOpen) {
-        setDevOpsMainOpen(false);
-        return;
-      }
-      if (state.fileViewerMainOpen) {
-        setFileViewerMainOpen(false);
+      if (state.devopsMainOpen || state.fileViewerMainOpen) {
+        setActiveMainOverlay(null);
         return;
       }
       if (isSessionRunning()) {
@@ -723,29 +605,15 @@
     }
   });
 
-  document.getElementById("top-git-diff-btn")?.addEventListener("click", () => {
-    if (state.devopsMainOpen && state.devopsActiveTab === "diff") {
-      setDevOpsMainOpen(false);
-    } else {
-      setDevOpsMainOpen(true, "diff");
-    }
-  });
-
-  document.getElementById("top-test-gate-btn")?.addEventListener("click", () => {
-    if (state.devopsMainOpen && state.devopsActiveTab === "tests") {
-      setDevOpsMainOpen(false);
-    } else {
-      setDevOpsMainOpen(true, "tests");
-    }
-  });
-
-  document.getElementById("top-deploy-health-btn")?.addEventListener("click", () => {
-    if (state.devopsMainOpen && state.devopsActiveTab === "deploy") {
-      setDevOpsMainOpen(false);
-    } else {
-      setDevOpsMainOpen(true, "deploy");
-    }
-  });
+  for (const [id, tab] of [
+    ["top-git-diff-btn", "diff"],
+    ["top-test-gate-btn", "tests"],
+    ["top-deploy-health-btn", "deploy"],
+  ]) {
+    document.getElementById(id)?.addEventListener("click", () => {
+      setDevOpsMainOpen(!(state.devopsMainOpen && state.devopsActiveTab === tab), tab);
+    });
+  }
 
   activeProjectBadge?.addEventListener("click", () => {
     setRightDrawerOpen(true);
@@ -762,20 +630,12 @@
   });
 
   function switchTab(tabName) {
-    if (tabName === "skills-tools") {
-      setSkillsToolsMainOpen(!state.skillsToolsMainOpen);
-      return;
-    }
     state.activeTab = tabName;
     if (!state.rightDrawerOpen) {
       setRightDrawerOpen(true);
     }
     document.querySelectorAll(".tab-btn").forEach((btn) => {
-      if (btn.dataset.tab === "skills-tools") {
-        btn.classList.toggle("active", state.skillsToolsMainOpen);
-      } else {
-        btn.classList.toggle("active", btn.dataset.tab === tabName);
-      }
+      btn.classList.toggle("active", btn.dataset.tab === tabName);
     });
     document.querySelectorAll(".tab-pane").forEach((pane) => {
       pane.classList.toggle("active", pane.id === `pane-${tabName}`);
@@ -859,11 +719,7 @@
     } else {
       delete state.sessionAliases[targetId];
     }
-    try {
-      localStorage.setItem("trellis.sessionAliases.v1", JSON.stringify(state.sessionAliases));
-    } catch {
-      // Ignore storage quota errors
-    }
+    saveSessionAliases();
     const sessionObj = state.sessions.find((s) => s.session_id === targetId);
     if (sessionObj) {
       sessionObj.custom_title = newTitle || null;
@@ -994,6 +850,15 @@
 
   // Modern Web Guidance: form-fields-automatically-fit-contents fallback + ime-safe-enter-submit
   const growablePromptWrap = document.getElementById("growable-prompt-wrap");
+  function setPromptValue(val, focus = false) {
+    if (!promptInput) return;
+    promptInput.value = val;
+    if (growablePromptWrap) {
+      growablePromptWrap.dataset.replicatedValue = val;
+    }
+    if (focus) promptInput.focus();
+  }
+
   if (typeof CSS !== "undefined" && !CSS.supports("field-sizing", "content") && growablePromptWrap) {
     promptInput.addEventListener("input", () => {
       growablePromptWrap.dataset.replicatedValue = promptInput.value;
@@ -1067,14 +932,8 @@
     if (chatBtn) {
       chatBtn.textContent = `💬 CHAT (${state.chatThread.length})`;
     }
-    if (state.devopsMainOpen) {
-      setDevOpsMainOpen(false);
-    }
-    if (state.fileViewerMainOpen) {
-      setFileViewerMainOpen(false);
-    }
-    if (state.skillsToolsMainOpen) {
-      setSkillsToolsMainOpen(false);
+    if (state.devopsMainOpen || state.fileViewerMainOpen || state.skillsToolsMainOpen) {
+      setActiveMainOverlay(null);
     }
     switchTab("chat");
     renderChatTab(true);
@@ -1129,10 +988,7 @@
       isCouncil: state.executionMode === "council",
     });
 
-    promptInput.value = "";
-    if (growablePromptWrap) {
-      growablePromptWrap.dataset.replicatedValue = "";
-    }
+    setPromptValue("");
   });
 
   document.getElementById("reset-view-btn")?.addEventListener("click", () => {
@@ -1483,49 +1339,27 @@
         continue;
       }
 
-      // Unordered List: - / * / •
-      if (/^([-*•])\s+/.test(trimmed)) {
+      // Unordered (- / * / •) or Ordered (1. / 2.) List
+      const isUl = /^[-*•]\s+/.test(trimmed);
+      if (isUl || /^\d+\.\s+/.test(trimmed)) {
+        const tag = isUl ? "ul" : "ol";
+        const itemRe = isUl ? /^[-*•]\s+(.+)$/ : /^\d+\.\s+(.+)$/;
         const items = [];
         while (i < lines.length) {
           const l = lines[i].trim();
-          const m = l.match(/^([-*•])\s+(.+)$/);
-          if (m) {
-            items.push(renderInlineMarkdown(m[2]));
-            i++;
-          } else if (lines[i].startsWith("  ") && items.length > 0 && l) {
-            const subClean = l.replace(/^([-*•])\s+/, "• ");
-            items[items.length - 1] += `<br/><span style="padding-inline-start:14px;display:inline-block;">${renderInlineMarkdown(
-              subClean
-            )}</span>`;
-            i++;
-          } else {
-            break;
-          }
-        }
-        blocks.push(`<ul class="md-list">${items.map((it) => `<li>${it}</li>`).join("")}</ul>`);
-        continue;
-      }
-
-      // Ordered List: 1. / 2.
-      if (/^\d+\.\s+/.test(trimmed)) {
-        const items = [];
-        while (i < lines.length) {
-          const l = lines[i].trim();
-          const m = l.match(/^\d+\.\s+(.+)$/);
+          const m = l.match(itemRe);
           if (m) {
             items.push(renderInlineMarkdown(m[1]));
             i++;
           } else if (lines[i].startsWith("  ") && items.length > 0 && l) {
-            const subClean = l.replace(/^([-*•])\s+/, "• ");
-            items[items.length - 1] += `<br/><span style="padding-inline-start:14px;display:inline-block;">${renderInlineMarkdown(
-              subClean
-            )}</span>`;
+            const subClean = l.replace(/^[-*•]\s+/, "• ");
+            items[items.length - 1] += `<br/><span style="padding-inline-start:14px;display:inline-block;">${renderInlineMarkdown(subClean)}</span>`;
             i++;
           } else {
             break;
           }
         }
-        blocks.push(`<ol class="md-list">${items.map((it) => `<li>${it}</li>`).join("")}</ol>`);
+        blocks.push(`<${tag} class="md-list">${items.map((it) => `<li>${it}</li>`).join("")}</${tag}>`);
         continue;
       }
 
@@ -1561,14 +1395,17 @@
     }
   });
 
-  function statusBadgeClass(st) {
-    if (st === "Running") return "running";
-    if (st === "Completed" || st === "DecisionGate") return "completed";
-    if (st === "AwaitingToolApproval" || st === "AwaitingUserInput") return "awaiting";
-    if (st === "Negotiating" || st === "Voting") return "negotiating";
-    if (st === "Winner") return "winner";
-    return "";
-  }
+  const STATUS_BADGE_CLASSES = {
+    Running: "running",
+    Completed: "completed",
+    DecisionGate: "completed",
+    AwaitingToolApproval: "awaiting",
+    AwaitingUserInput: "awaiting",
+    Negotiating: "negotiating",
+    Voting: "negotiating",
+    Winner: "winner",
+  };
+  const statusBadgeClass = (st) => STATUS_BADGE_CLASSES[st] || "";
 
   function renderAtelierLeftRail() {
     if (!atelierLeftRail) return;
@@ -1691,20 +1528,12 @@
     const srcFilter = state.skillsToolsSource || "all";
 
     // Collect distinct sources from skills + tools
-    const allSources = ["all"];
-    const seenSrc = new Set(["all"]);
-    for (const s of state.skills) {
-      if (s.source && !seenSrc.has(s.source)) {
-        seenSrc.add(s.source);
-        allSources.push(s.source);
-      }
-    }
-    for (const t of state.tools) {
-      if (t.server && !seenSrc.has(t.server)) {
-        seenSrc.add(t.server);
-        allSources.push(t.server);
-      }
-    }
+    const allSources = [
+      "all",
+      ...new Set(
+        [...state.skills.map((s) => s.source), ...state.tools.map((t) => t.server)].filter(Boolean)
+      ),
+    ];
 
     const filteredSkills =
       seg === "tools"
@@ -1919,15 +1748,20 @@
     listEl.querySelectorAll("[data-inject-prompt]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const prefix = btn.dataset.injectPrompt || "";
-        if (promptInput) {
-          promptInput.value = prefix + promptInput.value;
-          const wrap = document.getElementById("growable-prompt-wrap");
-          if (wrap) wrap.dataset.replicatedValue = promptInput.value;
-          promptInput.focus();
-        }
+        if (promptInput) setPromptValue(prefix + promptInput.value, true);
       });
     });
   }
+
+  const TOOL_VERB_MAP = {
+    read_file: "📖 Reading",
+    edit_file: "✏️ Editing",
+    write_file: "✏️ Editing",
+    run_command: "⚡ Running",
+    manage_task: "⚡ Running",
+    search_web: "🌐 Searching",
+    invoke_subagent: "🌿 Spawning",
+  };
 
   function describeActiveTask(msg) {
     if (msg.content && msg.content.length > 0) {
@@ -1941,21 +1775,11 @@
     if (msg.tool_calls && msg.tool_calls.length > 0) {
       const tc = msg.tool_calls[msg.tool_calls.length - 1];
       const name = tc.name || "tool";
-      let verb = "⚙ Executing";
-      if (name === "read_file") verb = "📖 Reading";
-      else if (name === "edit_file" || name === "write_file") verb = "✏️ Editing";
-      else if (name === "run_command" || name === "manage_task") verb = "⚡ Running";
-      else if (name === "search_web") verb = "🌐 Searching";
-      else if (name === "invoke_subagent") verb = "🌿 Spawning";
-      else if (name.includes("jev") || name.includes("verify")) verb = "🎯 Verifying";
-
+      const verb =
+        TOOL_VERB_MAP[name] ||
+        (name.includes("jev") || name.includes("verify") ? "🎯 Verifying" : "⚙ Executing");
       const target = tc.summary || "workspace operation";
-      return {
-        key: `${name}:${target}:${msg.tool_calls.length}`,
-        verb,
-        toolName: name,
-        target,
-      };
+      return { key: `${name}:${target}:${msg.tool_calls.length}`, verb, toolName: name, target };
     }
     const firstThinkLine = msg.thinking
       ? msg.thinking.split("\n").find((l) => l.trim().length > 0) || ""
@@ -2333,6 +2157,8 @@
     });
   }
 
+  const CHAT_ROLE_CLASSES = { user: "user", decision: "decision", council: "council" };
+
   function renderChatTab(scrollToBottom = false) {
     const pane = document.getElementById("pane-chat");
     if (!pane) return;
@@ -2363,14 +2189,7 @@
 
     for (const msg of state.chatThread) {
       const msgId = String(msg.id);
-      const roleClass =
-        msg.role === "user"
-          ? "user"
-          : msg.role === "decision"
-          ? "decision"
-          : msg.role === "council"
-          ? "council"
-          : "assistant";
+      const roleClass = CHAT_ROLE_CLASSES[msg.role] || "assistant";
 
       let article = Array.from(pane.querySelectorAll("article[data-msg-id]")).find(
         (el) => el.dataset.msgId === msgId
@@ -2706,15 +2525,13 @@
     }
     councilStageBanner.classList.remove("hidden");
     const c = state.council;
-    if (c.stage === "STAGE_1_PROPOSALS") {
-      councilBannerText.textContent = `🏛️ Stage 1/3: Parallel Proposals across ${c.participants.length} AIs...`;
-    } else if (c.stage === "STAGE_2_NEGOTIATION") {
-      councilBannerText.textContent = `⚔️ Stage 2/3: Cross-Critique & Peer Negotiation...`;
-    } else if (c.stage === "STAGE_3_VOTING") {
-      councilBannerText.textContent = `🗳️ Stage 3/3: Tallying Ranked-Choice Borda Ballots...`;
-    } else {
-      councilBannerText.textContent = `🏆 Council Winner: ${c.winning_provider || "Consensus Reached"}`;
-    }
+    const stageLabels = {
+      STAGE_1_PROPOSALS: `🏛️ Stage 1/3: Parallel Proposals across ${c.participants.length} AIs...`,
+      STAGE_2_NEGOTIATION: "⚔️ Stage 2/3: Cross-Critique & Peer Negotiation...",
+      STAGE_3_VOTING: "🗳️ Stage 3/3: Tallying Ranked-Choice Borda Ballots...",
+    };
+    councilBannerText.textContent =
+      stageLabels[c.stage] || `🏆 Council Winner: ${c.winning_provider || "Consensus Reached"}`;
   }
 
   function renderCouncilTab() {
@@ -2993,13 +2810,7 @@
     });
 
     container.querySelector("#fv-inject-prompt-btn")?.addEventListener("click", () => {
-      if (promptInput) {
-        const refText = `@${f.rel_path} `;
-        promptInput.value = refText + promptInput.value;
-        const wrap = document.getElementById("growable-prompt-wrap");
-        if (wrap) wrap.dataset.replicatedValue = promptInput.value;
-        promptInput.focus();
-      }
+      if (promptInput) setPromptValue(`@${f.rel_path} ` + promptInput.value, true);
     });
 
     container.querySelector("#fv-copy-btn")?.addEventListener("click", (e) => {
@@ -3315,18 +3126,17 @@
     return null;
   }
 
-  canvas.addEventListener("mousedown", (e) => {
+  function beginCanvasPointer(clientX, clientY, autoSwitchTab) {
     const rect = canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
+    const sx = clientX - rect.left;
+    const sy = clientY - rect.top;
     const { x: wx, y: wy } = screenToWorld(sx, sy);
-
     const hit = findNodeAt(wx, wy);
     if (hit) {
       state.selectedAgentId = hit.agent_id;
       state.draggingNode = hit;
       renderAgentTab();
-      if (state.activeTab !== "agent" && state.activeTab !== "council") {
+      if (autoSwitchTab && state.activeTab !== "agent" && state.activeTab !== "council") {
         switchTab("agent");
       }
     } else {
@@ -3335,18 +3145,17 @@
     state.dragStartX = sx;
     state.dragStartY = sy;
     requestDraw();
-  });
+  }
 
-  window.addEventListener("mousemove", (e) => {
+  function moveCanvasPointer(clientX, clientY) {
     if (!state.draggingNode && !state.isDraggingCanvas) return;
     const rect = canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
+    const sx = clientX - rect.left;
+    const sy = clientY - rect.top;
     const dx = sx - state.dragStartX;
     const dy = sy - state.dragStartY;
     state.dragStartX = sx;
     state.dragStartY = sy;
-
     if (state.draggingNode) {
       state.draggingNode.x += dx / state.zoom;
       state.draggingNode.y += dy / state.zoom;
@@ -3355,8 +3164,10 @@
       state.panY += dy;
     }
     requestDraw();
-  });
+  }
 
+  canvas.addEventListener("mousedown", (e) => beginCanvasPointer(e.clientX, e.clientY, true));
+  window.addEventListener("mousemove", (e) => moveCanvasPointer(e.clientX, e.clientY));
   window.addEventListener("mouseup", () => {
     state.draggingNode = null;
     state.isDraggingCanvas = false;
@@ -3383,7 +3194,6 @@
   canvas.addEventListener(
     "touchstart",
     (e) => {
-      const rect = canvas.getBoundingClientRect();
       if (e.touches.length === 2) {
         const dx = e.touches[0].clientX - e.touches[1].clientX;
         const dy = e.touches[0].clientY - e.touches[1].clientY;
@@ -3391,23 +3201,8 @@
         state.pinchStartZoom = state.zoom;
         state.draggingNode = null;
         state.isDraggingCanvas = false;
-        return;
-      }
-      if (e.touches.length === 1) {
-        const sx = e.touches[0].clientX - rect.left;
-        const sy = e.touches[0].clientY - rect.top;
-        const { x: wx, y: wy } = screenToWorld(sx, sy);
-        const hit = findNodeAt(wx, wy);
-        if (hit) {
-          state.selectedAgentId = hit.agent_id;
-          state.draggingNode = hit;
-          renderAgentTab();
-        } else {
-          state.isDraggingCanvas = true;
-        }
-        state.dragStartX = sx;
-        state.dragStartY = sy;
-        requestDraw();
+      } else if (e.touches.length === 1) {
+        beginCanvasPointer(e.touches[0].clientX, e.touches[0].clientY, false);
       }
     },
     { passive: true }
@@ -3425,25 +3220,8 @@
           Math.max(0.42, state.pinchStartZoom * (dist / state.pinchStartDist))
         );
         requestDraw();
-        return;
-      }
-      if (e.touches.length === 1) {
-        const rect = canvas.getBoundingClientRect();
-        const sx = e.touches[0].clientX - rect.left;
-        const sy = e.touches[0].clientY - rect.top;
-        const dx = sx - state.dragStartX;
-        const dy = sy - state.dragStartY;
-        state.dragStartX = sx;
-        state.dragStartY = sy;
-
-        if (state.draggingNode) {
-          state.draggingNode.x += dx / state.zoom;
-          state.draggingNode.y += dy / state.zoom;
-        } else if (state.isDraggingCanvas) {
-          state.panX += dx;
-          state.panY += dy;
-        }
-        requestDraw();
+      } else if (e.touches.length === 1) {
+        moveCanvasPointer(e.touches[0].clientX, e.touches[0].clientY);
       }
     },
     { passive: true }
@@ -3470,11 +3248,6 @@
   function requestDraw() {
     if (state.canvasPaused || state.animFrameId) return;
     state.animFrameId = requestAnimationFrame(drawCanvasFrame);
-  }
-
-  function drawRoundedRect(x, y, w, h, r) {
-    ctx.beginPath();
-    ctx.roundRect(x, y, w, h, r);
   }
 
   function drawTaskOrbitalSpinner(cx, cy, t, accentColor) {
@@ -3706,7 +3479,8 @@
           ? "rgba(78, 159, 130, 0.34)"
           : "rgba(168, 32, 42, 0.36)";
         ctx.lineWidth = 1.6;
-        drawRoundedRect(
+        ctx.beginPath();
+        ctx.roundRect(
           x - pulse,
           y - pulse,
           cardW + pulse * 2,
@@ -3721,14 +3495,16 @@
         ctx.shadowBlur = 14;
         ctx.shadowOffsetY = 4;
         ctx.fillStyle = isSelected ? "#141311" : "#211F1C";
-        drawRoundedRect(x, y, cardW, cardH, pillRadius);
+        ctx.beginPath();
+        ctx.roundRect(x, y, cardW, cardH, pillRadius);
         ctx.fill();
         ctx.restore();
 
         // Capsule border
         ctx.strokeStyle = isSelected ? "#F7F4EB" : taskAccent;
         ctx.lineWidth = isSelected ? 2.2 : 1.5;
-        drawRoundedRect(x, y, cardW, cardH, pillRadius);
+        ctx.beginPath();
+        ctx.roundRect(x, y, cardW, cardH, pillRadius);
         ctx.stroke();
 
         // Left Rotating Orbital / Gear Spinner
@@ -3782,7 +3558,8 @@
             ? "rgba(158, 71, 42, 0.45)"
             : "rgba(168, 32, 42, 0.38)";
         ctx.lineWidth = 2;
-        drawRoundedRect(x - pulse, y - pulse, cardW + pulse * 2, cardH + pulse * 2, radius + 3);
+        ctx.beginPath();
+        ctx.roundRect(x - pulse, y - pulse, cardW + pulse * 2, cardH + pulse * 2, radius + 3);
         ctx.stroke();
       }
 
@@ -3792,13 +3569,15 @@
       ctx.shadowBlur = 16;
       ctx.shadowOffsetY = 5;
       ctx.fillStyle = isSelected ? "#FCFAF4" : isSubagent ? "#F3F6F4" : "#F7F4EB";
-      drawRoundedRect(x, y, cardW, cardH, radius);
+      ctx.beginPath();
+      ctx.roundRect(x, y, cardW, cardH, radius);
       ctx.fill();
       ctx.restore();
 
       // Header band: Deep Laurel tint for active Subagents vs Weathered Trellis for Lead Agent
       ctx.fillStyle = isSubagent ? "#E1EBE6" : "#EFECE1";
-      drawRoundedRect(x, y, cardW, 30, { tl: radius, tr: radius, br: 0, bl: 0 });
+      ctx.beginPath();
+      ctx.roundRect(x, y, cardW, 30, { tl: radius, tr: radius, br: 0, bl: 0 });
       ctx.fill();
 
       // Card border (dashed Laurel/Crimson for ephemeral Subagent, solid for Lead Agent)
@@ -3814,7 +3593,8 @@
         ? "#2D4A3E"
         : "#D5CFC1";
       ctx.lineWidth = isSelected || agent.is_council_winner ? 2.2 : isSubagent ? 1.5 : 1.2;
-      drawRoundedRect(x, y, cardW, cardH, radius);
+      ctx.beginPath();
+      ctx.roundRect(x, y, cardW, cardH, radius);
       ctx.stroke();
       ctx.restore();
 
@@ -3989,21 +3769,14 @@
     if (!promptInput) return;
     document.getElementById("slash-cmd-popover")?.classList.add("hidden");
     if (autoSubmit) {
-      promptInput.value = "";
-      if (growablePromptWrap) {
-        growablePromptWrap.dataset.replicatedValue = "";
-      }
+      setPromptValue("");
       dispatchUserPrompt({
         promptText,
         isCouncil: state.executionMode === "council",
       });
       return;
     }
-    promptInput.value = promptText;
-    if (growablePromptWrap) {
-      growablePromptWrap.dataset.replicatedValue = promptText;
-    }
-    promptInput.focus();
+    setPromptValue(promptText, true);
   }
 
   document.querySelectorAll("#lifecycle-pipeline-dock [data-slash-cmd]").forEach((btn) => {
@@ -4753,18 +4526,7 @@
     newSessionDialog?.close();
   });
 
-  if (newSessionDialog && !("closedBy" in HTMLDialogElement.prototype)) {
-    newSessionDialog.addEventListener("click", (event) => {
-      if (event.target !== newSessionDialog) return;
-      const rect = newSessionDialog.getBoundingClientRect();
-      const inside =
-        rect.top <= event.clientY &&
-        event.clientY <= rect.top + rect.height &&
-        rect.left <= event.clientX &&
-        event.clientX <= rect.left + rect.width;
-      if (!inside) newSessionDialog.close();
-    });
-  }
+  bindDialogLightDismiss(newSessionDialog);
 
   newModeExistingBtn?.addEventListener("click", () => {
     setNewSessionDialogMode("existing_repo");

@@ -2,7 +2,7 @@ use crate::brain::code_root_dir;
 use crate::council::{now_iso_short, ActiveRunHandle, SharedAppState};
 use crate::models::{
     AgentNode, CiWorkflowRun, DeployHealthSnapshot, EndpointProbeResult, GitChangedFile,
-    GitCommitSummary, GitDiffPayload, GitStatusSnapshot, TestRunSnapshot, TokenMetrics, ToolCall,
+    GitCommitSummary, GitDiffPayload, GitStatusSnapshot, TestRunSnapshot, ToolCall,
     WorkspaceDevOpsSnapshot,
 };
 use serde_json::{json, Value};
@@ -15,7 +15,6 @@ use tokio::process::Command as TokioCommand;
 use tokio::sync::{broadcast, watch, RwLock};
 
 pub type DeployHealthSummary = DeployHealthSnapshot;
-pub type DevOpsCockpitSnapshot = WorkspaceDevOpsSnapshot;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TestRunnerSpec {
@@ -193,6 +192,16 @@ pub fn parse_git_porcelain_and_numstat(
     }
 }
 
+fn git_stdout(work_dir: &Path, args: &[&str]) -> String {
+    StdCommand::new("git")
+        .args(args)
+        .current_dir(work_dir)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
 /// Read-only probe of the active workspace's Git working tree.
 pub fn probe_git_status(project_id: &str) -> GitStatusSnapshot {
     let Ok((work_dir, _)) = validate_workspace_sandbox(project_id, None) else {
@@ -203,29 +212,9 @@ pub fn probe_git_status(project_id: &str) -> GitStatusSnapshot {
         };
     };
 
-    let porcelain = StdCommand::new("git")
-        .args(["status", "--porcelain=v1", "-b"])
-        .current_dir(&work_dir)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-
-    let numstat = StdCommand::new("git")
-        .args(["diff", "HEAD", "--numstat"])
-        .current_dir(&work_dir)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-
-    let log_raw = StdCommand::new("git")
-        .args(["log", "-n", "6", "--pretty=format:%h|%s|%an|%cr"])
-        .current_dir(&work_dir)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
+    let porcelain = git_stdout(&work_dir, &["status", "--porcelain=v1", "-b"]);
+    let numstat = git_stdout(&work_dir, &["diff", "HEAD", "--numstat"]);
+    let log_raw = git_stdout(&work_dir, &["log", "-n", "6", "--pretty=format:%h|%s|%an|%cr"]);
 
     parse_git_porcelain_and_numstat(&porcelain, &numstat, &log_raw)
 }
@@ -244,17 +233,10 @@ pub fn compute_workspace_diff(project_id: &str, target_path: Option<&str>) -> Gi
 
     let mut args = vec!["diff", "HEAD", "--unified=4"];
     if let Some(ref rel) = clean_rel {
-        args.push("--");
-        args.push(rel.as_str());
+        args.extend(["--", rel.as_str()]);
     }
 
-    let mut raw_diff = StdCommand::new("git")
-        .args(&args)
-        .current_dir(&work_dir)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
+    let mut raw_diff = git_stdout(&work_dir, &args);
 
     // If a specific untracked file was requested and `git diff HEAD` returned empty, synthesize an added-file unified diff
     if raw_diff.trim().is_empty() {
@@ -278,13 +260,7 @@ pub fn compute_workspace_diff(project_id: &str, target_path: Option<&str>) -> Gi
             }
         } else {
             // Working tree is clean: show latest commit diff (`git show HEAD`) so reviewer can inspect latest commit
-            raw_diff = StdCommand::new("git")
-                .args(["show", "--stat", "--patch", "--unified=3", "HEAD"])
-                .current_dir(&work_dir)
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default();
+            raw_diff = git_stdout(&work_dir, &["show", "--stat", "--patch", "--unified=3", "HEAD"]);
         }
     }
 
@@ -318,39 +294,23 @@ pub fn compute_workspace_diff(project_id: &str, target_path: Option<&str>) -> Gi
 
 /// Auto-detects the structured test runner specification (`program` + `args`) for a directory.
 pub fn detect_test_runner_spec_in_dir(work_dir: &Path) -> Option<TestRunnerSpec> {
-    if work_dir.join("Cargo.toml").is_file() {
-        return Some(TestRunnerSpec {
-            framework: "cargo".to_string(),
-            program: "cargo".to_string(),
-            args: vec!["test".to_string()],
-            display_command: "cargo test".to_string(),
-        });
-    }
-    if work_dir.join("package.json").is_file() {
-        return Some(TestRunnerSpec {
-            framework: "npm".to_string(),
-            program: "npm".to_string(),
-            args: vec!["test".to_string()],
-            display_command: "npm test".to_string(),
-        });
-    }
-    if work_dir.join("pyproject.toml").is_file() || work_dir.join("pytest.ini").is_file() {
-        return Some(TestRunnerSpec {
-            framework: "pytest".to_string(),
-            program: "pytest".to_string(),
-            args: vec![],
-            display_command: "pytest".to_string(),
-        });
-    }
-    if work_dir.join("go.mod").is_file() {
-        return Some(TestRunnerSpec {
-            framework: "go".to_string(),
-            program: "go".to_string(),
-            args: vec!["test".to_string(), "./...".to_string()],
-            display_command: "go test ./...".to_string(),
-        });
-    }
-    None
+    let spec = if work_dir.join("Cargo.toml").is_file() {
+        ("cargo", "cargo", &["test"][..], "cargo test")
+    } else if work_dir.join("package.json").is_file() {
+        ("npm", "npm", &["test"][..], "npm test")
+    } else if work_dir.join("pyproject.toml").is_file() || work_dir.join("pytest.ini").is_file() {
+        ("pytest", "pytest", &[][..], "pytest")
+    } else if work_dir.join("go.mod").is_file() {
+        ("go", "go", &["test", "./..."][..], "go test ./...")
+    } else {
+        return None;
+    };
+    Some(TestRunnerSpec {
+        framework: spec.0.to_string(),
+        program: spec.1.to_string(),
+        args: spec.2.iter().map(|s| s.to_string()).collect(),
+        display_command: spec.3.to_string(),
+    })
 }
 
 /// Thin compatibility wrapper around `detect_test_runner_spec_in_dir`.
@@ -370,38 +330,26 @@ pub fn detect_workspace_test_runner(project_id: &str) -> (String, String) {
 pub fn parse_test_runner_counts(framework: &str, output: &str, exit_ok: bool) -> (u32, u32) {
     let mut passed = 0u32;
     let mut failed = 0u32;
+    let mut add_seg = |s: &str| {
+        if let Some(n) = s.strip_suffix("passed") {
+            passed += n.split_whitespace().last().unwrap_or("0").parse().unwrap_or(0);
+        } else if let Some(n) = s.strip_suffix("failed") {
+            failed += n.split_whitespace().last().unwrap_or("0").parse().unwrap_or(0);
+        }
+    };
 
     for line in output.lines() {
         let trimmed = line.trim();
-        // Rust `cargo test` format: `test result: ok. 7 passed; 0 failed; ...`
         if trimmed.starts_with("test result:") {
             for seg in trimmed.split(';') {
-                let s = seg.trim();
-                if let Some(num_part) = s.strip_suffix("passed") {
-                    let tok = num_part.split_whitespace().last().unwrap_or("0");
-                    passed += tok.parse::<u32>().unwrap_or(0);
-                } else if let Some(num_part) = s.strip_suffix("failed") {
-                    let tok = num_part.split_whitespace().last().unwrap_or("0");
-                    failed += tok.parse::<u32>().unwrap_or(0);
-                }
+                add_seg(seg.trim());
             }
         } else if framework == "pytest"
             && (trimmed.contains(" passed") || trimmed.contains(" failed"))
         {
             for seg in trimmed.split(',') {
                 let raw_seg = seg.trim().trim_matches('=').trim();
-                let s = raw_seg
-                    .split(" in ")
-                    .next()
-                    .unwrap_or(raw_seg)
-                    .trim();
-                if let Some(num_part) = s.strip_suffix("passed") {
-                    let tok = num_part.split_whitespace().last().unwrap_or("0");
-                    passed += tok.parse::<u32>().unwrap_or(0);
-                } else if let Some(num_part) = s.strip_suffix("failed") {
-                    let tok = num_part.split_whitespace().last().unwrap_or("0");
-                    failed += tok.parse::<u32>().unwrap_or(0);
-                }
+                add_seg(raw_seg.split(" in ").next().unwrap_or(raw_seg).trim());
             }
         }
     }
@@ -642,19 +590,14 @@ pub async fn run_workspace_tests(
             ),
             context: format!("Workspace: ~/code/{}\nFramework: {}", project_id, framework),
             recent_log: format!("Running {}...", command_str),
-            tokens: TokenMetrics::default(),
             tool_calls: vec![ToolCall {
                 name: "run_workspace_tests".to_string(),
                 summary: format!("{} (~/code/{})", command_str, project_id),
                 status: "Running".to_string(),
             }],
-            outputs: vec![],
             x: 520.0,
             y: 265.0,
-            council_score: None,
-            is_council_winner: false,
-            decision_eval: None,
-            interactive_prompt: None,
+            ..Default::default()
         });
 
         let active_sess = st.active_session_id.clone();
@@ -693,7 +636,7 @@ pub async fn run_workspace_tests(
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
-    let final_snap = match out_res {
+    let (status, passed_count, failed_count, output_excerpt) = match out_res {
         Some(Ok(Ok(output))) => {
             let stdout_s = String::from_utf8_lossy(&output.stdout);
             let stderr_s = String::from_utf8_lossy(&output.stderr);
@@ -713,56 +656,23 @@ pub async fn run_workspace_tests(
                 .rev()
                 .collect::<Vec<_>>()
                 .join("\n");
-
-            TestRunSnapshot {
-                project_id: project_id.clone(),
-                framework,
-                command: command_str,
-                status: if exit_ok && failed == 0 {
-                    "Passed".to_string()
-                } else {
-                    "Failed".to_string()
-                },
-                passed_count: passed,
-                failed_count: failed,
-                duration_ms: elapsed_ms,
-                output_excerpt: excerpt,
-                last_run_at: Some(now_iso_short()),
-            }
+            (if exit_ok && failed == 0 { "Passed" } else { "Failed" }, passed, failed, excerpt)
         }
-        Some(Ok(Err(e))) => TestRunSnapshot {
-            project_id: project_id.clone(),
-            framework,
-            command: command_str,
-            status: "Failed".to_string(),
-            passed_count: 0,
-            failed_count: 1,
-            duration_ms: elapsed_ms,
-            output_excerpt: format!("Failed to spawn test runner: {}", e),
-            last_run_at: Some(now_iso_short()),
-        },
-        Some(Err(_)) => TestRunSnapshot {
-            project_id: project_id.clone(),
-            framework,
-            command: command_str,
-            status: "Failed".to_string(),
-            passed_count: 0,
-            failed_count: 1,
-            duration_ms: elapsed_ms,
-            output_excerpt: "Test suite timed out after 60 seconds.".to_string(),
-            last_run_at: Some(now_iso_short()),
-        },
-        None => TestRunSnapshot {
-            project_id: project_id.clone(),
-            framework,
-            command: command_str,
-            status: "Idle".to_string(),
-            passed_count: 0,
-            failed_count: 0,
-            duration_ms: elapsed_ms,
-            output_excerpt: "*(⏹ Test execution stopped by user.)*".to_string(),
-            last_run_at: Some(now_iso_short()),
-        },
+        Some(Ok(Err(e))) => ("Failed", 0, 1, format!("Failed to spawn test runner: {}", e)),
+        Some(Err(_)) => ("Failed", 0, 1, "Test suite timed out after 60 seconds.".to_string()),
+        None => ("Idle", 0, 0, "*(⏹ Test execution stopped by user.)*".to_string()),
+    };
+
+    let final_snap = TestRunSnapshot {
+        project_id: project_id.clone(),
+        framework,
+        command: command_str,
+        status: status.to_string(),
+        passed_count,
+        failed_count,
+        duration_ms: elapsed_ms,
+        output_excerpt,
+        last_run_at: Some(now_iso_short()),
     };
 
     {

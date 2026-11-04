@@ -402,8 +402,16 @@ pub fn extract_project_slug_from_text(text: &str) -> Option<String> {
     None
 }
 
+fn is_valid_session_id(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains("..")
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+}
+
 pub fn infer_session_project_id(session_id: &str) -> String {
-    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+    if !is_valid_session_id(session_id) {
         return "exo-suit".to_string();
     }
     let s_path = brain_dir().join(session_id);
@@ -434,12 +442,7 @@ pub fn infer_session_project_id(session_id: &str) -> String {
 }
 
 pub fn save_session_project_id(session_id: &str, project_id: &str) -> bool {
-    if session_id.is_empty()
-        || session_id.contains("..")
-        || session_id.contains('/')
-        || session_id.contains('\\')
-        || session_id.contains('\0')
-    {
+    if !is_valid_session_id(session_id) {
         return false;
     }
     let Ok(valid_slug) = validate_project_slug(project_id) else {
@@ -453,7 +456,7 @@ pub fn save_session_project_id(session_id: &str, project_id: &str) -> bool {
 }
 
 pub fn resolve_execution_scope(session_id: &str, requested_project: &str) -> ExecutionScope {
-    let clean_session = if session_id.trim().is_empty() || session_id.contains("..") {
+    let clean_session = if !is_valid_session_id(session_id.trim()) {
         "default-session".to_string()
     } else {
         session_id.trim().to_string()
@@ -610,7 +613,7 @@ pub fn get_past_sessions(limit: usize) -> Vec<SessionItem> {
 }
 
 pub fn rename_session(session_id: &str, new_title: &str) -> bool {
-    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+    if !is_valid_session_id(session_id) {
         return false;
     }
     let s_path = brain_dir().join(session_id);
@@ -723,125 +726,47 @@ fn scan_skills_dir(dir: &Path, source_label: &str, out: &mut Vec<SkillItem>, see
 
 pub fn get_installed_skills() -> Vec<SkillItem> {
     let home = home_dir();
-    let gemini = home.join(".gemini");
     let mut skills = Vec::new();
     let mut seen = HashSet::new();
+    const SKILL_SOURCES: [(&str, &str); 19] = [
+        ("code/code-gardening/skills", "code-gardening"),
+        (".gemini/skills", "user-skills"),
+        (".gemini/config/skills", "config-skills"),
+        (".gemini/antigravity-cli/skills", "agy-skills"),
+        (".gemini/antigravity-cli/builtin/skills", "builtin-skills"),
+        (".config/muse/skills", "muse-skills"),
+        (".agents/skills", "agents-skills"),
+        (".claude/skills", "claude-skills"),
+        (".codex/skills", "codex-skills"),
+        (".copilot/skills", "copilot-skills"),
+        (".cursor/skills", "cursor-skills"),
+        (".config/opencode/skills", "opencode-skills"),
+        (".config/goose/skills", "goose-skills"),
+        (".config/amp/skills", "amp-skills"),
+        (".factory/skills", "droid-skills"),
+        (".qwen/skills", "qwen-skills"),
+        (".continue/skills", "continue-skills"),
+        (".cline/skills", "cline-skills"),
+        (".config/crush/skills", "crush-skills"),
+    ];
 
-    scan_skills_dir(
-        &home.join("code").join("code-gardening").join("skills"),
-        "code-gardening",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(&gemini.join("skills"), "user-skills", &mut skills, &mut seen);
-    scan_skills_dir(&gemini.join("config").join("skills"), "config-skills", &mut skills, &mut seen);
-    scan_skills_dir(
-        &gemini.join("antigravity-cli").join("skills"),
-        "agy-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &gemini.join("antigravity-cli").join("builtin").join("skills"),
-        "builtin-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".config").join("muse").join("skills"),
-        "muse-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".agents").join("skills"),
-        "agents-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".claude").join("skills"),
-        "claude-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".codex").join("skills"),
-        "codex-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".copilot").join("skills"),
-        "copilot-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".cursor").join("skills"),
-        "cursor-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".config").join("opencode").join("skills"),
-        "opencode-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".config").join("goose").join("skills"),
-        "goose-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".config").join("amp").join("skills"),
-        "amp-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".factory").join("skills"),
-        "droid-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".qwen").join("skills"),
-        "qwen-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".continue").join("skills"),
-        "continue-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".cline").join("skills"),
-        "cline-skills",
-        &mut skills,
-        &mut seen,
-    );
-    scan_skills_dir(
-        &home.join(".config").join("crush").join("skills"),
-        "crush-skills",
-        &mut skills,
-        &mut seen,
-    );
+    for (rel, label) in SKILL_SOURCES {
+        scan_skills_dir(&home.join(rel), label, &mut skills, &mut seen);
+    }
 
     // Also scan plugin skills under ~/.gemini/config/plugins/*/skills
-    let plugins_dir = gemini.join("config").join("plugins");
-    if let Ok(rd) = fs::read_dir(&plugins_dir) {
+    if let Ok(rd) = fs::read_dir(home.join(".gemini/config/plugins")) {
         let mut p_entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
         p_entries.sort_by_key(|e| e.file_name());
         for pe in p_entries {
-            let p_name = pe.file_name().to_string_lossy().to_string();
             let p_skills = pe.path().join("skills");
             if p_skills.is_dir() {
-                scan_skills_dir(&p_skills, &p_name, &mut skills, &mut seen);
+                scan_skills_dir(
+                    &p_skills,
+                    &pe.file_name().to_string_lossy(),
+                    &mut skills,
+                    &mut seen,
+                );
             }
         }
     }
@@ -851,88 +776,29 @@ pub fn get_installed_skills() -> Vec<SkillItem> {
 }
 
 pub fn get_tool_catalog() -> Vec<ToolCatalogItem> {
-    let mut tools = vec![
-        ToolCatalogItem {
-            name: "read_file".to_string(),
-            server: "native-harness".to_string(),
-            mode: "EAGER".to_string(),
-            description: "Read the contents of a text, image, pdf, video, or audio file (up to 800 lines or 46KB per read).".to_string(),
-            parameters_summary: "Path (required), StartLine, EndLine, ByteOffset".to_string(),
-            schema_preview: "{\n  \"name\": \"read_file\",\n  \"required\": [\"Path\"],\n  \"properties\": {\n    \"Path\": { \"type\": \"STRING\", \"description\": \"Absolute path of the file to read\" },\n    \"StartLine\": { \"type\": \"INTEGER\" },\n    \"EndLine\": { \"type\": \"INTEGER\" },\n    \"ByteOffset\": { \"type\": \"INTEGER\" }\n  }\n}".to_string(),
-        },
-        ToolCatalogItem {
-            name: "edit_file".to_string(),
-            server: "native-harness".to_string(),
-            mode: "EAGER".to_string(),
-            description: "Modify an existing file with exact contiguous target-to-replacement matching.".to_string(),
-            parameters_summary: "Path (required), Target (required), Replacement (required), ArtifactMetadata".to_string(),
-            schema_preview: "{\n  \"name\": \"edit_file\",\n  \"required\": [\"Path\", \"Target\", \"Replacement\"],\n  \"properties\": {\n    \"Path\": { \"type\": \"STRING\" },\n    \"Target\": { \"type\": \"STRING\" },\n    \"Replacement\": { \"type\": \"STRING\" }\n  }\n}".to_string(),
-        },
-        ToolCatalogItem {
-            name: "write_file".to_string(),
-            server: "native-harness".to_string(),
-            mode: "EAGER".to_string(),
-            description: "Create a new file or overwrite/append to an existing file or artifact.".to_string(),
-            parameters_summary: "Path (required), Content (required), Overwrite, Append, ArtifactMetadata".to_string(),
-            schema_preview: "{\n  \"name\": \"write_file\",\n  \"required\": [\"Path\", \"Content\"],\n  \"properties\": {\n    \"Path\": { \"type\": \"STRING\" },\n    \"Content\": { \"type\": \"STRING\" },\n    \"Overwrite\": { \"type\": \"BOOLEAN\" },\n    \"Append\": { \"type\": \"BOOLEAN\" }\n  }\n}".to_string(),
-        },
-        ToolCatalogItem {
-            name: "run_command".to_string(),
-            server: "native-harness".to_string(),
-            mode: "EAGER".to_string(),
-            description: "Execute a command in the workspace zsh shell synchronously or as a background daemon task.".to_string(),
-            parameters_summary: "CommandLine (required), WaitMsBeforeAsync (required), toolSummary (required), IsDaemon".to_string(),
-            schema_preview: "{\n  \"name\": \"run_command\",\n  \"required\": [\"CommandLine\", \"WaitMsBeforeAsync\", \"toolSummary\"],\n  \"properties\": {\n    \"CommandLine\": { \"type\": \"STRING\" },\n    \"WaitMsBeforeAsync\": { \"type\": \"INTEGER\" },\n    \"toolSummary\": { \"type\": \"STRING\" },\n    \"IsDaemon\": { \"type\": \"BOOLEAN\" }\n  }\n}".to_string(),
-        },
-        ToolCatalogItem {
-            name: "invoke_subagent".to_string(),
-            server: "native-harness".to_string(),
-            mode: "EAGER".to_string(),
-            description: "Launch an autonomous subagent in its own conversation context with isolated or shared workspace.".to_string(),
-            parameters_summary: "TypeName (required), Role (required), Prompt (required), Model, Workspace".to_string(),
-            schema_preview: "{\n  \"name\": \"invoke_subagent\",\n  \"required\": [\"TypeName\", \"Role\", \"Prompt\"],\n  \"properties\": {\n    \"TypeName\": { \"type\": \"STRING\" },\n    \"Role\": { \"type\": \"STRING\" },\n    \"Prompt\": { \"type\": \"STRING\" },\n    \"Model\": { \"enum\": [\"inherit\", \"flash_lite\", \"flash\", \"pro\"] }\n  }\n}".to_string(),
-        },
-        ToolCatalogItem {
-            name: "define_subagent".to_string(),
-            server: "native-harness".to_string(),
-            mode: "EAGER".to_string(),
-            description: "Define a specialized subagent archetype with custom system prompt and tool permissions.".to_string(),
-            parameters_summary: "Name (required), Description (required), SystemPrompt (required), EnableWriteTools, EnableMCPTools".to_string(),
-            schema_preview: "{\n  \"name\": \"define_subagent\",\n  \"required\": [\"Name\", \"Description\", \"SystemPrompt\"]\n}".to_string(),
-        },
-        ToolCatalogItem {
-            name: "manage_task".to_string(),
-            server: "native-harness".to_string(),
-            mode: "EAGER".to_string(),
-            description: "List, inspect status/logs, send input to, or terminate background tasks.".to_string(),
-            parameters_summary: "Action (list | status | send_input | kill), TaskId, Input".to_string(),
-            schema_preview: "{\n  \"name\": \"manage_task\",\n  \"required\": [\"Action\"],\n  \"properties\": {\n    \"Action\": { \"enum\": [\"list\", \"kill\", \"status\", \"send_input\"] },\n    \"TaskId\": { \"type\": \"STRING\" }\n  }\n}".to_string(),
-        },
-        ToolCatalogItem {
-            name: "call_mcp_tool".to_string(),
-            server: "native-harness".to_string(),
-            mode: "EAGER".to_string(),
-            description: "Invoke any lazy-loaded MCP server tool after inspecting its JSON schema.".to_string(),
-            parameters_summary: "ServerName (required), ToolName (required), Arguments (required)".to_string(),
-            schema_preview: "{\n  \"name\": \"call_mcp_tool\",\n  \"required\": [\"ServerName\", \"ToolName\", \"Arguments\"]\n}".to_string(),
-        },
-        ToolCatalogItem {
-            name: "search_web".to_string(),
-            server: "native-harness".to_string(),
-            mode: "EAGER".to_string(),
-            description: "Perform a web search for a query and return a synthesized summary with URL citations.".to_string(),
-            parameters_summary: "query (required), domain (optional)".to_string(),
-            schema_preview: "{\n  \"name\": \"search_web\",\n  \"required\": [\"query\"]\n}".to_string(),
-        },
-        ToolCatalogItem {
-            name: "ask_question".to_string(),
-            server: "native-harness".to_string(),
-            mode: "EAGER".to_string(),
-            description: "Present interactive single-select or multi-select clarification questions directly to the user in the harness.".to_string(),
-            parameters_summary: "questions (required: array of {question, options, is_multi_select})".to_string(),
-            schema_preview: "{\n  \"name\": \"ask_question\",\n  \"required\": [\"questions\"],\n  \"properties\": {\n    \"questions\": {\n      \"type\": \"ARRAY\",\n      \"items\": {\n        \"properties\": {\n          \"question\": { \"type\": \"STRING\" },\n          \"options\": { \"type\": \"ARRAY\", \"items\": { \"type\": \"STRING\" } },\n          \"is_multi_select\": { \"type\": \"BOOLEAN\" }\n        }\n      }\n    }\n  }\n}".to_string(),
-        },
+    const NATIVE_TOOLS: [(&str, &str, &str, &str); 10] = [
+        ("read_file", "Read the contents of a text, image, pdf, video, or audio file (up to 800 lines or 46KB per read).", "Path (required), StartLine, EndLine, ByteOffset", "{\n  \"name\": \"read_file\",\n  \"required\": [\"Path\"],\n  \"properties\": {\n    \"Path\": { \"type\": \"STRING\", \"description\": \"Absolute path of the file to read\" },\n    \"StartLine\": { \"type\": \"INTEGER\" },\n    \"EndLine\": { \"type\": \"INTEGER\" },\n    \"ByteOffset\": { \"type\": \"INTEGER\" }\n  }\n}"),
+        ("edit_file", "Modify an existing file with exact contiguous target-to-replacement matching.", "Path (required), Target (required), Replacement (required), ArtifactMetadata", "{\n  \"name\": \"edit_file\",\n  \"required\": [\"Path\", \"Target\", \"Replacement\"],\n  \"properties\": {\n    \"Path\": { \"type\": \"STRING\" },\n    \"Target\": { \"type\": \"STRING\" },\n    \"Replacement\": { \"type\": \"STRING\" }\n  }\n}"),
+        ("write_file", "Create a new file or overwrite/append to an existing file or artifact.", "Path (required), Content (required), Overwrite, Append, ArtifactMetadata", "{\n  \"name\": \"write_file\",\n  \"required\": [\"Path\", \"Content\"],\n  \"properties\": {\n    \"Path\": { \"type\": \"STRING\" },\n    \"Content\": { \"type\": \"STRING\" },\n    \"Overwrite\": { \"type\": \"BOOLEAN\" },\n    \"Append\": { \"type\": \"BOOLEAN\" }\n  }\n}"),
+        ("run_command", "Execute a command in the workspace zsh shell synchronously or as a background daemon task.", "CommandLine (required), WaitMsBeforeAsync (required), toolSummary (required), IsDaemon", "{\n  \"name\": \"run_command\",\n  \"required\": [\"CommandLine\", \"WaitMsBeforeAsync\", \"toolSummary\"],\n  \"properties\": {\n    \"CommandLine\": { \"type\": \"STRING\" },\n    \"WaitMsBeforeAsync\": { \"type\": \"INTEGER\" },\n    \"toolSummary\": { \"type\": \"STRING\" },\n    \"IsDaemon\": { \"type\": \"BOOLEAN\" }\n  }\n}"),
+        ("invoke_subagent", "Launch an autonomous subagent in its own conversation context with isolated or shared workspace.", "TypeName (required), Role (required), Prompt (required), Model, Workspace", "{\n  \"name\": \"invoke_subagent\",\n  \"required\": [\"TypeName\", \"Role\", \"Prompt\"],\n  \"properties\": {\n    \"TypeName\": { \"type\": \"STRING\" },\n    \"Role\": { \"type\": \"STRING\" },\n    \"Prompt\": { \"type\": \"STRING\" },\n    \"Model\": { \"enum\": [\"inherit\", \"flash_lite\", \"flash\", \"pro\"] }\n  }\n}"),
+        ("define_subagent", "Define a specialized subagent archetype with custom system prompt and tool permissions.", "Name (required), Description (required), SystemPrompt (required), EnableWriteTools, EnableMCPTools", "{\n  \"name\": \"define_subagent\",\n  \"required\": [\"Name\", \"Description\", \"SystemPrompt\"]\n}"),
+        ("manage_task", "List, inspect status/logs, send input to, or terminate background tasks.", "Action (list | status | send_input | kill), TaskId, Input", "{\n  \"name\": \"manage_task\",\n  \"required\": [\"Action\"],\n  \"properties\": {\n    \"Action\": { \"enum\": [\"list\", \"kill\", \"status\", \"send_input\"] },\n    \"TaskId\": { \"type\": \"STRING\" }\n  }\n}"),
+        ("call_mcp_tool", "Invoke any lazy-loaded MCP server tool after inspecting its JSON schema.", "ServerName (required), ToolName (required), Arguments (required)", "{\n  \"name\": \"call_mcp_tool\",\n  \"required\": [\"ServerName\", \"ToolName\", \"Arguments\"]\n}"),
+        ("search_web", "Perform a web search for a query and return a synthesized summary with URL citations.", "query (required), domain (optional)", "{\n  \"name\": \"search_web\",\n  \"required\": [\"query\"]\n}"),
+        ("ask_question", "Present interactive single-select or multi-select clarification questions directly to the user in the harness.", "questions (required: array of {question, options, is_multi_select})", "{\n  \"name\": \"ask_question\",\n  \"required\": [\"questions\"],\n  \"properties\": {\n    \"questions\": {\n      \"type\": \"ARRAY\",\n      \"items\": {\n        \"properties\": {\n          \"question\": { \"type\": \"STRING\" },\n          \"options\": { \"type\": \"ARRAY\", \"items\": { \"type\": \"STRING\" } },\n          \"is_multi_select\": { \"type\": \"BOOLEAN\" }\n        }\n      }\n    }\n  }\n}"),
     ];
+    let mut tools: Vec<ToolCatalogItem> = NATIVE_TOOLS
+        .into_iter()
+        .map(|(name, desc, params, schema)| ToolCatalogItem {
+            name: name.to_string(),
+            server: "native-harness".to_string(),
+            mode: "EAGER".to_string(),
+            description: desc.to_string(),
+            parameters_summary: params.to_string(),
+            schema_preview: schema.to_string(),
+        })
+        .collect();
 
     // Dynamically scan ~/.gemini/antigravity-cli/mcp/<server>/*.json for MCP tool schemas
     let mcp_root = home_dir().join(".gemini").join("antigravity-cli").join("mcp");
@@ -1091,7 +957,7 @@ pub fn approve_artifact_metadata(session_id: &str, artifact_name: &str) -> bool 
 }
 
 pub fn load_session_interactive_answers(session_id: &str) -> HashMap<String, Vec<String>> {
-    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+    if !is_valid_session_id(session_id) {
         return HashMap::new();
     }
     let p = brain_dir().join(session_id).join(".interactive_answers.json");
@@ -1106,7 +972,7 @@ pub fn save_session_interactive_answer(
     prompt_id: &str,
     answers: &[String],
 ) -> bool {
-    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+    if !is_valid_session_id(session_id) {
         return false;
     }
     let s_dir = brain_dir().join(session_id);
@@ -1270,54 +1136,81 @@ fn extract_generic_step_answers(content: &str) -> Vec<String> {
 }
 
 fn load_transcript_values(session_id: &str) -> Vec<Value> {
-    let logs_dir = brain_dir()
-        .join(session_id)
-        .join(".system_generated")
-        .join("logs");
-    let transcript_p = logs_dir.join("transcript.jsonl");
-    let Ok(raw) = fs::read_to_string(&transcript_p) else {
+    let logs_dir = brain_dir().join(session_id).join(".system_generated/logs");
+    let Ok(raw) = fs::read_to_string(logs_dir.join("transcript.jsonl")) else {
         return Vec::new();
+    };
+    let is_truncated_target = |l: &str| {
+        l.contains("\"truncated_fields\"")
+            && [
+                "\"ask_question\"",
+                "Tool is running as a background task",
+                "Created the following subagent",
+                "background task(s) currently running",
+                "\"invoke_subagent\"",
+                "\"run_command\"",
+            ]
+            .iter()
+            .any(|pat| l.contains(pat))
     };
 
     let raw_lines: Vec<&str> = raw.lines().collect();
-    let needs_full = raw_lines.iter().any(|l| {
-        l.contains("\"truncated_fields\"")
-            && (l.contains("\"ask_question\"")
-                || l.contains("Tool is running as a background task")
-                || l.contains("Created the following subagent")
-                || l.contains("background task(s) currently running")
-                || l.contains("\"invoke_subagent\"")
-                || l.contains("\"run_command\""))
-    });
-
-    let full_lines: Vec<String> = if needs_full {
+    let full_lines: Vec<String> = if raw_lines.iter().any(|l| is_truncated_target(l)) {
         fs::read_to_string(logs_dir.join("transcript_full.jsonl"))
-            .map(|s| s.lines().map(|l| l.to_string()).collect())
+            .map(|s| s.lines().map(String::from).collect())
             .unwrap_or_default()
     } else {
         Vec::new()
     };
 
-    let mut out = Vec::with_capacity(raw_lines.len());
-    for (idx, line) in raw_lines.into_iter().enumerate() {
-        let use_line = if line.contains("\"truncated_fields\"")
-            && (line.contains("\"ask_question\"")
-                || line.contains("Tool is running as a background task")
-                || line.contains("Created the following subagent")
-                || line.contains("background task(s) currently running")
-                || line.contains("\"invoke_subagent\"")
-                || line.contains("\"run_command\""))
-            && idx < full_lines.len()
-        {
-            full_lines[idx].as_str()
-        } else {
-            line
-        };
-        if let Ok(val) = serde_json::from_str::<Value>(use_line) {
-            out.push(val);
+    raw_lines
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let src = if is_truncated_target(line) {
+                full_lines.get(idx).map(String::as_str).unwrap_or(line)
+            } else {
+                line
+            };
+            serde_json::from_str::<Value>(src).ok()
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_assistant_turn(
+    thread: &mut Vec<ChatMessage>,
+    id: String,
+    step_index: u32,
+    timestamp: String,
+    content: &mut String,
+    thinking: &mut Option<String>,
+    tools: &mut Vec<ToolCall>,
+    streaming: bool,
+    interactive_prompt: Option<InteractivePrompt>,
+) {
+    if tools.len() > 45 {
+        *tools = tools.split_off(tools.len() - 45);
+    }
+    if streaming {
+        if let Some(last_tc) = tools.last_mut() {
+            last_tc.status = "Running".to_string();
         }
     }
-    out
+    thread.push(ChatMessage {
+        id,
+        step_index,
+        role: "assistant".to_string(),
+        sender: "Antigravity".to_string(),
+        provider: "antigravity".to_string(),
+        model: "gemini-4-argon".to_string(),
+        timestamp,
+        content: std::mem::take(content),
+        thinking: thinking.take(),
+        tool_calls: std::mem::take(tools),
+        streaming,
+        interactive_prompt,
+    });
 }
 
 /// Parses a session's `transcript.jsonl` into a chronological conversation thread of user and
@@ -1369,25 +1262,8 @@ pub fn get_session_chat_thread(session_id: &str) -> Vec<ChatMessage> {
             }
 
             // Flush any previous assistant turn before starting a new user turn
-            if !pending_content.is_empty() || pending_thinking.is_some() || !pending_tools.is_empty()
-            {
-                if pending_tools.len() > 45 {
-                    pending_tools = pending_tools.split_off(pending_tools.len() - 45);
-                }
-                thread.push(ChatMessage {
-                    id: format!("msg-turn-{}", turn_anchor_step),
-                    step_index: pending_step,
-                    role: "assistant".to_string(),
-                    sender: "Antigravity".to_string(),
-                    provider: "antigravity".to_string(),
-                    model: "gemini-4-argon".to_string(),
-                    timestamp: pending_ts.clone(),
-                    content: std::mem::take(&mut pending_content),
-                    thinking: pending_thinking.take(),
-                    tool_calls: std::mem::take(&mut pending_tools),
-                    streaming: false,
-                    interactive_prompt: None,
-                });
+            if !pending_content.is_empty() || pending_thinking.is_some() || !pending_tools.is_empty() {
+                push_assistant_turn(&mut thread, format!("msg-turn-{}", turn_anchor_step), pending_step, pending_ts.clone(), &mut pending_content, &mut pending_thinking, &mut pending_tools, false, None);
             }
 
             thread.push(ChatMessage {
@@ -1496,32 +1372,8 @@ pub fn get_session_chat_thread(session_id: &str) -> Vec<ChatMessage> {
             // If this PLANNER_RESPONSE presented interactive questions via `ask_question`,
             // surface it immediately as a dedicated interactive message card in the chat thread!
             if !step_interactive_questions.is_empty() {
-                let reconciled = reconcile_interactive_prompt(
-                    step_index,
-                    step_interactive_questions,
-                    &steps[idx + 1..],
-                    &saved_answers,
-                );
-
-                if pending_tools.len() > 45 {
-                    pending_tools = pending_tools.split_off(pending_tools.len() - 45);
-                }
-
-                thread.push(ChatMessage {
-                    id: format!("msg-ask-{}", step_index),
-                    step_index,
-                    role: "assistant".to_string(),
-                    sender: "Antigravity".to_string(),
-                    provider: "antigravity".to_string(),
-                    model: "gemini-4-argon".to_string(),
-                    timestamp: pending_ts.clone(),
-                    content: std::mem::take(&mut pending_content),
-                    thinking: pending_thinking.take(),
-                    tool_calls: std::mem::take(&mut pending_tools),
-                    streaming: false,
-                    interactive_prompt: Some(reconciled),
-                });
-
+                let reconciled = reconcile_interactive_prompt(step_index, step_interactive_questions, &steps[idx + 1..], &saved_answers);
+                push_assistant_turn(&mut thread, format!("msg-ask-{}", step_index), step_index, pending_ts.clone(), &mut pending_content, &mut pending_thinking, &mut pending_tools, false, Some(reconciled));
                 turn_anchor_step = step_index + 1;
                 pending_step = step_index + 1;
                 has_open_turn = false;
@@ -1530,35 +1382,9 @@ pub fn get_session_chat_thread(session_id: &str) -> Vec<ChatMessage> {
     }
 
     // Emit the final/active assistant turn at the end of the transcript
-    if has_open_turn
-        || !pending_content.is_empty()
-        || pending_thinking.is_some()
-        || !pending_tools.is_empty()
-    {
-        if pending_tools.len() > 45 {
-            pending_tools = pending_tools.split_off(pending_tools.len() - 45);
-        }
-        // The turn is actively streaming/working only if final content hasn't arrived yet
+    if has_open_turn || !pending_content.is_empty() || pending_thinking.is_some() || !pending_tools.is_empty() {
         let is_streaming = pending_content.is_empty();
-        if is_streaming {
-            if let Some(last_tc) = pending_tools.last_mut() {
-                last_tc.status = "Running".to_string();
-            }
-        }
-        thread.push(ChatMessage {
-            id: format!("msg-turn-{}", turn_anchor_step),
-            step_index: pending_step,
-            role: "assistant".to_string(),
-            sender: "Antigravity".to_string(),
-            provider: "antigravity".to_string(),
-            model: "gemini-4-argon".to_string(),
-            timestamp: pending_ts,
-            content: pending_content,
-            thinking: pending_thinking.take(),
-            tool_calls: std::mem::take(&mut pending_tools),
-            streaming: is_streaming,
-            interactive_prompt: None,
-        });
+        push_assistant_turn(&mut thread, format!("msg-turn-{}", turn_anchor_step), pending_step, pending_ts, &mut pending_content, &mut pending_thinking, &mut pending_tools, is_streaming, None);
     }
 
     // Keep the most recent 60 messages to preserve the sub-20MB memory footprint
@@ -2169,75 +1995,96 @@ fn parse_session_node_recursive(
     }
 }
 
+fn decision_prim(key: &str, primitive_type: &str, value: &str, numeric_value: Option<f32>, confidence: f32, description: &str) -> DecisionPrimitive {
+    DecisionPrimitive {
+        key: key.to_string(),
+        primitive_type: primitive_type.to_string(),
+        value: value.to_string(),
+        numeric_value,
+        confidence,
+        description: description.to_string(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_fallback_node(
+    id_parent_kind: (String, String, &str),
+    prov_model_role: (&str, &str, String),
+    status_step: (&str, u32),
+    text_fields: (String, &str, String, String),
+    tokens: (u64, u64, u64),
+    tool_calls: Vec<ToolCall>,
+    outputs: Vec<String>,
+    pos: (f32, f32),
+    council_score: Option<f32>,
+    decision_eval: Option<DecisionEvaluation>,
+) -> AgentNode {
+    AgentNode {
+        agent_id: id_parent_kind.0,
+        parent_id: id_parent_kind.1,
+        node_kind: id_parent_kind.2.to_string(),
+        provider: prov_model_role.0.to_string(),
+        model: prov_model_role.1.to_string(),
+        role: prov_model_role.2,
+        status: status_step.0.to_string(),
+        execution_step: status_step.1,
+        prompt: text_fields.0,
+        thinking: text_fields.1.to_string(),
+        context: text_fields.2,
+        recent_log: text_fields.3,
+        tokens: TokenMetrics { input_tokens: tokens.0, cache_read_tokens: tokens.1, output_tokens: tokens.2 },
+        tool_calls,
+        outputs,
+        x: pos.0,
+        y: pos.1,
+        council_score,
+        is_council_winner: false,
+        decision_eval,
+        interactive_prompt: None,
+    }
+}
+
 pub fn fallback_project_graph(project_name: &str) -> Vec<AgentNode> {
     let p_clean = Path::new(project_name)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "exo-suit".to_string());
+    let orch_id = format!("{}-orchestrator", p_clean);
 
     vec![
-        AgentNode {
-            agent_id: format!("{}-orchestrator", p_clean),
-            parent_id: String::new(),
-            node_kind: "agent".to_string(),
-            provider: "antigravity".to_string(),
-            model: "gemini-4-argon".to_string(),
-            role: format!("{} Lead Orchestrator", p_clean),
-            status: "Running".to_string(),
-            execution_step: 12,
-            prompt: format!("Orchestrate multi-provider workflow for {}", p_clean),
-            thinking: "Evaluating workspace dependency graph and subagent readiness.".to_string(),
-            context: format!("Workspace: ~/code/{}", p_clean),
-            recent_log: format!("Monitoring ~/code/{}...", p_clean),
-            tokens: TokenMetrics {
-                input_tokens: 14200,
-                cache_read_tokens: 9800,
-                output_tokens: 640,
-            },
-            tool_calls: vec![ToolCall {
-                name: "list_dir".to_string(),
-                summary: format!("Scanned ~/code/{}", p_clean),
-                status: "Completed".to_string(),
-            }],
-            outputs: vec![format!("Workspace {} ready", p_clean)],
-            x: 460.0,
-            y: 140.0,
-            council_score: None,
-            is_council_winner: false,
-            decision_eval: None,
-            interactive_prompt: None,
-        },
-        AgentNode {
-            agent_id: format!("{}-jev-gate", p_clean),
-            parent_id: format!("{}-orchestrator", p_clean),
-            node_kind: "gate".to_string(),
-            provider: "jev".to_string(),
-            model: "jev-latest".to_string(),
-            role: "🎯 Jev System-1 Gate".to_string(),
-            status: "DecisionGate".to_string(),
-            execution_step: 4,
-            prompt: format!("Evaluate System-1 decision primitives (Noul, Choice, Score) for {}", p_clean),
-            thinking: "Sub-200ms TypeSafe AI System-1 evaluation over quantized state.".to_string(),
-            context: format!("Model Class: DECISION_SYSTEM_1\nSLA: <200ms • Fail-Closed Safety\nWorkspace: ~/code/{}", p_clean),
-            recent_log: "NOUL: 0.92 • CHOICE: allow_execution • SCORE: high".to_string(),
-            tokens: TokenMetrics {
-                input_tokens: 420,
-                cache_read_tokens: 380,
-                output_tokens: 48,
-            },
-            tool_calls: vec![ToolCall {
-                name: "jev_evaluate_primitives".to_string(),
-                summary: "Evaluated {noul, choice, score} in 18ms".to_string(),
-                status: "Completed".to_string(),
-            }],
-            outputs: vec![
-                "NOUL (Safety Confidence): 0.92\nCHOICE (Routing Action): allow_execution\nSCORE (Invariant Rubric): high_compliance (0.94)".to_string(),
-            ],
-            x: 220.0,
-            y: 340.0,
-            council_score: Some(9.4),
-            is_council_winner: false,
-            decision_eval: Some(DecisionEvaluation {
+        make_fallback_node(
+            (orch_id.clone(), String::new(), "agent"),
+            ("antigravity", "gemini-4-argon", format!("{} Lead Orchestrator", p_clean)),
+            ("Running", 12),
+            (
+                format!("Orchestrate multi-provider workflow for {}", p_clean),
+                "Evaluating workspace dependency graph and subagent readiness.",
+                format!("Workspace: ~/code/{}", p_clean),
+                format!("Monitoring ~/code/{}...", p_clean),
+            ),
+            (14200, 9800, 640),
+            vec![ToolCall { name: "list_dir".to_string(), summary: format!("Scanned ~/code/{}", p_clean), status: "Completed".to_string() }],
+            vec![format!("Workspace {} ready", p_clean)],
+            (460.0, 140.0),
+            None,
+            None,
+        ),
+        make_fallback_node(
+            (format!("{}-jev-gate", p_clean), orch_id.clone(), "gate"),
+            ("jev", "jev-latest", "🎯 Jev System-1 Gate".to_string()),
+            ("DecisionGate", 4),
+            (
+                format!("Evaluate System-1 decision primitives (Noul, Choice, Score) for {}", p_clean),
+                "Sub-200ms TypeSafe AI System-1 evaluation over quantized state.",
+                format!("Model Class: DECISION_SYSTEM_1\nSLA: <200ms • Fail-Closed Safety\nWorkspace: ~/code/{}", p_clean),
+                "NOUL: 0.92 • CHOICE: allow_execution • SCORE: high".to_string(),
+            ),
+            (420, 380, 48),
+            vec![ToolCall { name: "jev_evaluate_primitives".to_string(), summary: "Evaluated {noul, choice, score} in 18ms".to_string(), status: "Completed".to_string() }],
+            vec!["NOUL (Safety Confidence): 0.92\nCHOICE (Routing Action): allow_execution\nSCORE (Invariant Rubric): high_compliance (0.94)".to_string()],
+            (220.0, 340.0),
+            Some(9.4),
+            Some(DecisionEvaluation {
                 engine: "jev-latest (TypeSafe System-1)".to_string(),
                 noul_risk_prob: 0.08,
                 choice_action: "allow_execution".to_string(),
@@ -2246,92 +2093,46 @@ pub fn fallback_project_graph(project_name: &str) -> Vec<AgentNode> {
                 gate_status: "ALLOW_EXECUTION".to_string(),
                 latency_ms: 18,
                 primitives: vec![
-                    DecisionPrimitive {
-                        key: "regression_risk_noul".to_string(),
-                        primitive_type: "noul".to_string(),
-                        value: "0.08".to_string(),
-                        numeric_value: Some(0.08),
-                        confidence: 0.95,
-                        description: "Probability of invariant regression or unsafe side-effect".to_string(),
-                    },
-                    DecisionPrimitive {
-                        key: "execution_route_choice".to_string(),
-                        primitive_type: "choice".to_string(),
-                        value: "allow_execution".to_string(),
-                        numeric_value: None,
-                        confidence: 0.94,
-                        description: "Discrete System-1 gate routing decision".to_string(),
-                    },
-                    DecisionPrimitive {
-                        key: "architecture_alignment_score".to_string(),
-                        primitive_type: "score".to_string(),
-                        value: "high_compliance (0.94)".to_string(),
-                        numeric_value: Some(0.94),
-                        confidence: 0.93,
-                        description: "Ordinal rubric score against project boundary rules".to_string(),
-                    },
+                    decision_prim("regression_risk_noul", "noul", "0.08", Some(0.08), 0.95, "Probability of invariant regression or unsafe side-effect"),
+                    decision_prim("execution_route_choice", "choice", "allow_execution", None, 0.94, "Discrete System-1 gate routing decision"),
+                    decision_prim("architecture_alignment_score", "score", "high_compliance (0.94)", Some(0.94), 0.93, "Ordinal rubric score against project boundary rules"),
                 ],
             }),
-            interactive_prompt: None,
-        },
-        AgentNode {
-            agent_id: format!("{}-verifier", p_clean),
-            parent_id: format!("{}-orchestrator", p_clean),
-            node_kind: "subagent".to_string(),
-            provider: "claude".to_string(),
-            model: "claude-4-sonnet".to_string(),
-            role: "Adversarial Verifier".to_string(),
-            status: "AwaitingToolApproval".to_string(),
-            execution_step: 6,
-            prompt: "Run zero-trust verification gate on candidate changes.".to_string(),
-            thinking: "Checking boundary invariants and memory allocations.".to_string(),
-            context: format!("Gate: Zero-Trust Disproof in ~/code/{}", p_clean),
-            recent_log: "Pending approval: cargo test --release".to_string(),
-            tokens: TokenMetrics {
-                input_tokens: 6100,
-                cache_read_tokens: 4000,
-                output_tokens: 310,
-            },
-            tool_calls: vec![ToolCall {
-                name: "run_command".to_string(),
-                summary: "cargo test --release".to_string(),
-                status: "Pending".to_string(),
-            }],
-            outputs: vec![],
-            x: 460.0,
-            y: 340.0,
-            council_score: None,
-            is_council_winner: false,
-            decision_eval: None,
-            interactive_prompt: None,
-        },
-        AgentNode {
-            agent_id: format!("{}-worker", p_clean),
-            parent_id: format!("{}-orchestrator", p_clean),
-            node_kind: "task".to_string(),
-            provider: "codex".to_string(),
-            model: "TASK • task-1".to_string(),
-            role: "cargo test --release".to_string(),
-            status: "Running".to_string(),
-            execution_step: 9,
-            prompt: "Optimize hot-path allocations and binary framing.".to_string(),
-            thinking: "Replaced dynamic heap allocations with bounded ring buffers.".to_string(),
-            context: format!("Path: ~/code/{}/src", p_clean),
-            recent_log: "Zero-allocation pass verified.".to_string(),
-            tokens: TokenMetrics {
-                input_tokens: 4800,
-                cache_read_tokens: 2100,
-                output_tokens: 520,
-            },
-            tool_calls: vec![],
-            outputs: vec!["All benchmarks passed (<1ms frame time)".to_string()],
-            x: 700.0,
-            y: 340.0,
-            council_score: None,
-            is_council_winner: false,
-            decision_eval: None,
-            interactive_prompt: None,
-        },
+        ),
+        make_fallback_node(
+            (format!("{}-verifier", p_clean), orch_id.clone(), "subagent"),
+            ("claude", "claude-4-sonnet", "Adversarial Verifier".to_string()),
+            ("AwaitingToolApproval", 6),
+            (
+                "Run zero-trust verification gate on candidate changes.".to_string(),
+                "Checking boundary invariants and memory allocations.",
+                format!("Gate: Zero-Trust Disproof in ~/code/{}", p_clean),
+                "Pending approval: cargo test --release".to_string(),
+            ),
+            (6100, 4000, 310),
+            vec![ToolCall { name: "run_command".to_string(), summary: "cargo test --release".to_string(), status: "Pending".to_string() }],
+            vec![],
+            (460.0, 340.0),
+            None,
+            None,
+        ),
+        make_fallback_node(
+            (format!("{}-worker", p_clean), orch_id, "task"),
+            ("codex", "TASK • task-1", "cargo test --release".to_string()),
+            ("Running", 9),
+            (
+                "Optimize hot-path allocations and binary framing.".to_string(),
+                "Replaced dynamic heap allocations with bounded ring buffers.",
+                format!("Path: ~/code/{}/src", p_clean),
+                "Zero-allocation pass verified.".to_string(),
+            ),
+            (4800, 2100, 520),
+            vec![],
+            vec!["All benchmarks passed (<1ms frame time)".to_string()],
+            (700.0, 340.0),
+            None,
+            None,
+        ),
     ]
 }
 
@@ -2554,25 +2355,18 @@ pub fn provision_workspace_and_session(
 }
 
 pub fn load_session_agy_conversation_id(session_id: &str) -> Option<String> {
-    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+    if !is_valid_session_id(session_id) {
         return None;
     }
     let map_file = brain_dir().join(session_id).join(".agy_conversation_id.txt");
-    if let Ok(raw) = fs::read_to_string(&map_file) {
-        let trimmed = raw.trim().to_string();
-        if !trimmed.is_empty() {
-            return Some(trimmed);
-        }
-    }
-    None
+    fs::read_to_string(&map_file)
+        .ok()
+        .map(|r| r.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn save_session_agy_conversation_id(session_id: &str, agy_conv_id: &str) {
-    if session_id.is_empty()
-        || session_id.contains("..")
-        || session_id.contains('/')
-        || agy_conv_id.trim().is_empty()
-    {
+    if !is_valid_session_id(session_id) || agy_conv_id.trim().is_empty() {
         return;
     }
     let s_dir = brain_dir().join(session_id);
@@ -2589,7 +2383,7 @@ pub fn append_turn_to_session_transcript(
     thinking: Option<&str>,
     tokens: &TokenMetrics,
 ) {
-    if session_id.is_empty() || session_id.contains("..") || session_id.contains('/') {
+    if !is_valid_session_id(session_id) {
         return;
     }
     if load_session_agy_conversation_id(session_id).as_deref() == Some(session_id) {

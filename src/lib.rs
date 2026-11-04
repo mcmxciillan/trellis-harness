@@ -31,14 +31,7 @@ use models::ClientCommand;
 use notify::{Event, RecursiveMode, Result as NotifyResult, Watcher};
 use providers::build_provider_registry;
 use serde_json::json;
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicU16, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc::UnboundedSender, RwLock};
 
 pub const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -47,18 +40,11 @@ pub const APP_JS: &str = include_str!("../web/app.js");
 pub const MANIFEST_JSON: &str = include_str!("../web/manifest.json");
 pub const LOGO_JPG: &[u8] = include_bytes!("../trellis-espalier.jpg");
 
-static RUNTIME_PORT: AtomicU16 = AtomicU16::new(0);
-
 pub fn set_runtime_port(port: u16) {
-    RUNTIME_PORT.store(port, Ordering::Relaxed);
     council::set_active_server_port(port);
 }
 
 pub fn resolve_runtime_port() -> u16 {
-    let configured = RUNTIME_PORT.load(Ordering::Relaxed);
-    if configured != 0 {
-        return configured;
-    }
     council::active_server_port()
 }
 
@@ -87,64 +73,36 @@ pub fn build_router(ctx: ServerContext) -> Router {
         .with_state(ctx)
 }
 
-async fn index_handler() -> Response {
+fn no_cache_response(content_type: &'static str, body: impl IntoResponse) -> Response {
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
         ],
-        INDEX_HTML,
+        body,
     )
         .into_response()
+}
+
+async fn index_handler() -> Response {
+    no_cache_response("text/html; charset=utf-8", INDEX_HTML)
 }
 
 async fn styles_handler() -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
-        ],
-        STYLES_CSS,
-    )
-        .into_response()
+    no_cache_response("text/css; charset=utf-8", STYLES_CSS)
 }
 
 async fn js_handler() -> Response {
-    (
-        StatusCode::OK,
-        [
-            (
-                header::CONTENT_TYPE,
-                "application/javascript; charset=utf-8",
-            ),
-            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
-        ],
-        APP_JS,
-    )
-        .into_response()
+    no_cache_response("application/javascript; charset=utf-8", APP_JS)
 }
 
 async fn manifest_handler() -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/manifest+json"),
-            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
-        ],
-        MANIFEST_JSON,
-    )
-        .into_response()
+    no_cache_response("application/manifest+json", MANIFEST_JSON)
 }
 
 async fn logo_handler() -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "image/jpeg")],
-        LOGO_JPG,
-    )
-        .into_response()
+    (StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], LOGO_JPG).into_response()
 }
 
 async fn raw_file_handler(
@@ -355,6 +313,61 @@ pub async fn dispatch_client_command(
     }
 }
 
+fn extract_top_slug(path: &str) -> &str {
+    path.trim_matches('/').split('/').next().unwrap_or("").trim()
+}
+
+async fn resolve_cmd_project(
+    cmd_proj: Option<String>,
+    ctx: &ServerContext,
+) -> (String, Option<models::TestRunSnapshot>) {
+    let st = ctx.state.read().await;
+    let p = cmd_proj
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| st.active_project.clone());
+    let ct = st.devops_tests.get(&p).cloned();
+    (p, ct)
+}
+
+async fn reload_session_context(
+    state: &Arc<RwLock<SharedAppState>>,
+    s_id: &str,
+    proj: &str,
+    reset_council: bool,
+) -> (Vec<models::AgentNode>, Vec<models::ArtifactItem>, Vec<models::ChatMessage>, models::WorkspaceDevOpsSnapshot) {
+    let agents = build_live_session_graph(s_id, proj);
+    let artifacts = get_session_artifacts(s_id);
+    let (chat_thread, cached_test) = {
+        let mut st = state.write().await;
+        st.active_session_id = s_id.to_string();
+        st.active_project = proj.to_string();
+        if reset_council {
+            st.council = None;
+        }
+        st.agents = agents.clone();
+        let ct = st.devops_tests.get(proj).cloned();
+        (st.load_merged_session_chat(s_id), ct)
+    };
+    let devops = build_workspace_devops_snapshot(proj, cached_test, resolve_runtime_port());
+    (agents, artifacts, chat_thread, devops)
+}
+
+async fn bind_active_project(
+    ctx: &ServerContext,
+    s_id: &str,
+    proj: &str,
+) -> (Vec<models::AgentNode>, Option<models::TestRunSnapshot>) {
+    save_session_project_id(s_id, proj);
+    let updated_agents = build_live_session_graph(s_id, proj);
+    let cached_test = {
+        let mut st = ctx.state.write().await;
+        st.active_project = proj.to_string();
+        st.agents = updated_agents.clone();
+        st.devops_tests.get(proj).cloned()
+    };
+    (updated_agents, cached_test)
+}
+
 async fn handle_browse_dir(
     cmd: ClientCommand,
     ctx: &ServerContext,
@@ -362,13 +375,7 @@ async fn handle_browse_dir(
 ) {
     let path = cmd.path.unwrap_or_default();
     let tree = list_directory_contents(&path);
-    let top_slug = path
-        .trim_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let top_slug = extract_top_slug(&path).to_string();
 
     let _ = direct_tx.send(json!({ "type": "DIRECTORY_CONTENTS", "file_browser": tree }).to_string());
     if !top_slug.is_empty()
@@ -387,14 +394,7 @@ async fn switch_project_on_browse(ctx: &ServerContext, top_slug: &str) {
     if current_proj == top_slug {
         return;
     }
-    save_session_project_id(&s_id, top_slug);
-    let updated_agents = build_live_session_graph(&s_id, top_slug);
-    let cached_test = {
-        let mut st = ctx.state.write().await;
-        st.active_project = top_slug.to_string();
-        st.agents = updated_agents.clone();
-        st.devops_tests.get(top_slug).cloned()
-    };
+    let (updated_agents, cached_test) = bind_active_project(ctx, &s_id, top_slug).await;
     let sessions = get_past_sessions(25);
     let devops = build_workspace_devops_snapshot(top_slug, cached_test, resolve_runtime_port());
     let _ = ctx.tx.send(
@@ -419,24 +419,16 @@ async fn handle_open_file(
         let st = ctx.state.read().await;
         (st.active_session_id.clone(), st.active_project.clone())
     };
-    let opened = resolve_sandboxed_file_path(&target, &s_id, &proj)
-        .and_then(|_| read_bounded_file(&target, &s_id, &proj));
-    match opened {
-        Some(f) => {
-            let _ = direct_tx.send(json!({ "type": "FILE_OPENED", "file": f }).to_string());
-        }
-        None => {
-            let _ = direct_tx.send(
-                json!({
-                    "type": "COMMAND_ERROR",
-                    "command": "OPEN_FILE",
-                    "path": target,
-                    "error": "File not found or outside workspace sandbox"
-                })
-                .to_string(),
-            );
-        }
-    }
+    let msg = match read_bounded_file(&target, &s_id, &proj) {
+        Some(f) => json!({ "type": "FILE_OPENED", "file": f }),
+        None => json!({
+            "type": "COMMAND_ERROR",
+            "command": "OPEN_FILE",
+            "path": target,
+            "error": "File not found or outside workspace sandbox"
+        }),
+    };
+    let _ = direct_tx.send(msg.to_string());
 }
 
 async fn handle_refresh_devops(
@@ -444,15 +436,7 @@ async fn handle_refresh_devops(
     ctx: &ServerContext,
     direct_tx: &UnboundedSender<String>,
 ) {
-    let (proj, cached_test) = {
-        let st = ctx.state.read().await;
-        let p = cmd
-            .project_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| st.active_project.clone());
-        let ct = st.devops_tests.get(&p).cloned();
-        (p, ct)
-    };
+    let (proj, cached_test) = resolve_cmd_project(cmd.project_id, ctx).await;
     let devops = build_workspace_devops_snapshot(&proj, cached_test, resolve_runtime_port());
     let _ = direct_tx.send(json!({ "type": "DEVOPS_UPDATED", "devops": devops }).to_string());
 }
@@ -462,24 +446,14 @@ async fn handle_open_git_diff(
     ctx: &ServerContext,
     direct_tx: &UnboundedSender<String>,
 ) {
-    let proj = {
-        let st = ctx.state.read().await;
-        cmd.project_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| st.active_project.clone())
-    };
+    let (proj, _) = resolve_cmd_project(cmd.project_id, ctx).await;
     let diff_payload = compute_workspace_diff(&proj, cmd.path.as_deref());
     let _ = direct_tx
         .send(json!({ "type": "GIT_DIFF_OPENED", "git_diff": diff_payload }).to_string());
 }
 
 async fn handle_run_workspace_tests(cmd: ClientCommand, ctx: &ServerContext) {
-    let proj = {
-        let st = ctx.state.read().await;
-        cmd.project_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| st.active_project.clone())
-    };
+    let (proj, _) = resolve_cmd_project(cmd.project_id, ctx).await;
     tokio::spawn(run_workspace_tests(
         ctx.state.clone(),
         ctx.tx.clone(),
@@ -490,24 +464,10 @@ async fn handle_run_workspace_tests(cmd: ClientCommand, ctx: &ServerContext) {
 
 async fn handle_set_project(cmd: ClientCommand, ctx: &ServerContext) {
     let raw_proj = cmd.path.unwrap_or_else(|| "exo-suit".to_string());
-    let proj = raw_proj
-        .trim_matches('/')
-        .split('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("exo-suit")
-        .to_string();
-    let s_id = {
-        let st = ctx.state.read().await;
-        st.active_session_id.clone()
-    };
-    save_session_project_id(&s_id, &proj);
-    let updated_agents = build_live_session_graph(&s_id, &proj);
-    {
-        let mut st = ctx.state.write().await;
-        st.active_project = proj;
-        st.agents = updated_agents;
-    }
+    let slug = extract_top_slug(&raw_proj);
+    let proj = if slug.is_empty() { "exo-suit" } else { slug }.to_string();
+    let s_id = ctx.state.read().await.active_session_id.clone();
+    let _ = bind_active_project(ctx, &s_id, &proj).await;
     let snap = generate_snapshot_json(&ctx.state).await;
     let _ = ctx.tx.send(snap);
 }
@@ -516,20 +476,8 @@ async fn handle_select_session(cmd: ClientCommand, ctx: &ServerContext) {
     let s_id = cmd.session_id.unwrap_or_default();
     let inferred_proj = infer_session_project_id(&s_id);
     let file_tree = list_directory_contents(&inferred_proj);
-    let agents = build_live_session_graph(&s_id, &inferred_proj);
-    let artifacts = get_session_artifacts(&s_id);
-    let (chat_thread, cached_test) = {
-        let mut st = ctx.state.write().await;
-        st.active_session_id = s_id.clone();
-        st.active_project = inferred_proj.clone();
-        st.council = None;
-        st.agents = agents.clone();
-        let merged_chat = st.load_merged_session_chat(&s_id);
-        let ct = st.devops_tests.get(&inferred_proj).cloned();
-        (merged_chat, ct)
-    };
-    let devops =
-        build_workspace_devops_snapshot(&inferred_proj, cached_test, resolve_runtime_port());
+    let (agents, artifacts, chat_thread, devops) =
+        reload_session_context(&ctx.state, &s_id, &inferred_proj, true).await;
     let _ = ctx.tx.send(
         json!({
             "type": "SESSION_LOADED",
@@ -589,21 +537,10 @@ async fn finalize_created_session(
     let new_sid = prov.session_id.clone();
     let new_proj = prov.project_id.clone();
     let file_tree = list_directory_contents(&new_proj);
-    let agents = build_live_session_graph(&new_sid, &new_proj);
-    let artifacts = get_session_artifacts(&new_sid);
-    let (chat_thread, cached_test) = {
-        let mut st = ctx.state.write().await;
-        st.active_session_id = new_sid.clone();
-        st.active_project = new_proj.clone();
-        st.council = None;
-        st.agents = agents.clone();
-        let merged_chat = st.load_merged_session_chat(&new_sid);
-        let ct = st.devops_tests.get(&new_proj).cloned();
-        (merged_chat, ct)
-    };
+    let (agents, artifacts, chat_thread, devops) =
+        reload_session_context(&ctx.state, &new_sid, &new_proj, true).await;
     let sessions = get_past_sessions(25);
     let available_projects = list_workspace_projects();
-    let devops = build_workspace_devops_snapshot(&new_proj, cached_test, resolve_runtime_port());
     let _ = ctx.tx.send(
         json!({
             "type": "SESSION_CREATED",
@@ -873,16 +810,8 @@ pub fn spawn_brain_watcher(state: Arc<RwLock<SharedAppState>>, tx: broadcast::Se
             }
             last_transcript_len = current_len;
 
-            let updated_nodes = build_live_session_graph(&s_id, &proj);
-            let artifacts = get_session_artifacts(&s_id);
-            let (updated_chat, cached_test) = {
-                let mut st = state.write().await;
-                st.agents = updated_nodes.clone();
-                let ct = st.devops_tests.get(&proj).cloned();
-                (st.load_merged_session_chat(&s_id), ct)
-            };
-            let devops =
-                build_workspace_devops_snapshot(&proj, cached_test, resolve_runtime_port());
+            let (updated_nodes, artifacts, updated_chat, devops) =
+                reload_session_context(&state, &s_id, &proj, false).await;
             let _ = tx.send(
                 json!({
                     "type": "LIVE_BRAIN_UPDATE",

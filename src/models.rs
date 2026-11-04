@@ -39,7 +39,7 @@ pub struct DecisionEvaluation {
     pub primitives: Vec<DecisionPrimitive>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenMetrics {
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
@@ -70,7 +70,7 @@ pub struct InteractivePrompt {
     pub answers: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: String,
     pub step_index: u32,
@@ -88,7 +88,7 @@ pub struct ChatMessage {
     pub interactive_prompt: Option<InteractivePrompt>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AgentNode {
     pub agent_id: String,
     pub parent_id: String,
