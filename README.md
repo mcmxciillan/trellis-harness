@@ -9,9 +9,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/rust-2021_edition-A8202A?style=flat-square&logo=rust" alt="Rust Edition" />
+  <img src="https://img.shields.io/badge/rust-2024_edition-A8202A?style=flat-square&logo=rust" alt="Rust Edition" />
   <img src="https://img.shields.io/badge/binary-single_executable-2D4A3E?style=flat-square" alt="Single Binary" />
-  <img src="https://img.shields.io/badge/tests-30_passed_(5_seams)-2D4A3E?style=flat-square" alt="30 Tests Passing" />
+  <img src="https://img.shields.io/badge/agents-23_coding_agents_&_APIs-0064E0?style=flat-square" alt="23 Coding Agents & APIs" />
+  <img src="https://img.shields.io/badge/tests-43_passed_(5_seams)-2D4A3E?style=flat-square" alt="43 Tests Passing" />
   <img src="https://img.shields.io/badge/frontend-zero_dependency_PWA-7D796F?style=flat-square" alt="Zero-Dependency PWA" />
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-262420?style=flat-square" alt="MIT License" /></a>
 </p>
@@ -115,7 +116,7 @@ flowchart LR
 | [`src/main.rs`](./src/main.rs) | Binary entrypoint initializing `SharedAppState`, binding `0.0.0.0:9000`, and launching the Axum server. |
 | [`src/brain.rs`](./src/brain.rs) | JSONL transcript parser, active subagent/task pruning, `ask_question` reconciliation, sandbox path guards, and workspace/session provisioning. |
 | [`src/council.rs`](./src/council.rs) | `SharedAppState`, zero-bleed session chat scoping, hard execution cancellation (`ActiveRunHandle`), independent prompt runner, and 3-Stage Borda Council engine. |
-| [`src/providers.rs`](./src/providers.rs) | Multi-provider registry (`agy`, `muse`, `claude`, `codex`, `deepseek`, `kimi`, `copilot`, `jev`), CLI/API execution adapters, and NaN-safe Jev System-1 evaluation. |
+| [`src/providers.rs`](./src/providers.rs) | Universal 23-agent provider registry, 7-dialect JSONL stream parser (`agy`, `muse`, `claude`, `gemini`, `codex`, `copilot`, `opencode`), headless CLI & HTTP API adapters, and NaN-safe Jev System-1 evaluation. |
 | [`src/devops.rs`](./src/devops.rs) | Git status/porcelain/numstat parser, bounded unified diff generator, polyglot test runner auto-detector & executor, and CI/health readiness probes. |
 | [`src/models.rs`](./src/models.rs) | Serde data contracts for telemetry snapshots, DAG nodes, Council ballots, DevOps snapshots, and WebSocket client commands. |
 | [`web/`](./web/) | Embedded zero-dependency HTML5 Canvas2D UI (`index.html`, `styles.css`, `app.js`, `manifest.json`). |
@@ -124,18 +125,35 @@ flowchart LR
 
 ## Multi-Provider & 3-Stage Council Engine
 
-Trellis orchestrates **8 AI providers** across two distinct cognitive classes:
+Trellis orchestrates **23 coding agents and model providers** across two distinct cognitive classes, normalizing **7 JSONL streaming dialects** (`agy`, `muse` MSP v1, `claude`/`amp`/`cursor-agent`, `gemini`/`qwen`/`droid`, `codex`, `copilot`, and `opencode`) into real-time DAG telemetry nodes and scanning **15+ agent skill directories** (`~/.gemini/skills`, `~/.config/muse/skills`, `~/.claude/skills`, `~/.codex/skills`, `~/.copilot/skills`, `~/.cursor/skills`, `~/.config/opencode/skills`, `~/.config/goose/skills`, `~/.config/amp/skills`, `~/.factory/skills`, `~/.qwen/skills`, `~/.continue/skills`, `~/.cline/skills`, `~/.config/crush/skills`, `~/.agents/skills`):
 
-| Provider | Model Class | Default Model | Specialty |
+| Agent / Provider | Category | Default Model | CLI / API Transport & Specialty |
 | :--- | :--- | :--- | :--- |
-| **Jev (`jev-latest`)** | `DECISION_SYSTEM_1` | `jev-latest` | Sub-200ms TypeSafe AI System-1 decision primitives (`Noul` risk probability, `Choice` routing verdict, `Score` rubric compliance) with NaN-safe fail-closed fallback |
-| **Antigravity (`agy`)** | `GENERATIVE_SYSTEM_2` | `gemini-4-argon` | Multi-agent graph orchestration & deep repository execution |
-| **Meta Muse Code (`muse`)** | `GENERATIVE_SYSTEM_2` | `muse-spark-1.3` | Long-horizon agentic coding, worktree subagents & 1M-context reasoning (`muse-spark-1.3`, `muse-wonder-1.0`, `muse-spark-open`, `muse-glimmer`) |
-| **Claude Code** | `GENERATIVE_SYSTEM_2` | `claude-4-sonnet` | Deep module design, boundary invariants & adversarial review |
-| **OpenAI Codex** | `GENERATIVE_SYSTEM_2` | `codex-mini-latest` | Low-latency code synthesis & surgical patching |
-| **DeepSeek** | `GENERATIVE_SYSTEM_2` | `deepseek-reasoner` | First-principles algorithmic reasoning & math verification |
-| **Kimi (Moonshot)** | `GENERATIVE_SYSTEM_2` | `kimi-k2-5` | Long-context cross-repository synthesis |
-| **GitHub Copilot** | `GENERATIVE_SYSTEM_2` | `copilot-gpt-4o` | CLI workflow automation & PR/issue integration |
+| **Jev (`jev-latest`)** | `DECISION_SYSTEM_1` | `jev-latest` | Sub-200ms TypeSafe AI System-1 decision primitives (`Noul`, `Choice`, `Score`) with NaN-safe fail-closed fallback |
+| **Antigravity (`agy`)** | Frontier CLI Agent | `gemini-4-argon` | `agy --output-format stream-json` • Multi-agent graph orchestration & deep repository execution |
+| **Google Gemini CLI (`gemini`)** | Frontier CLI & API | `gemini-2.5-pro` | `gemini -p --output-format stream-json --approval-mode yolo` & Gemini OpenAI API • 1M-context multimodal reasoning |
+| **Meta Muse Code (`muse`)** | Frontier CLI & API | `muse-spark-1.3` | `muse exec --json` (MSP v1) & Meta Model API (`api.meta.ai/v1`) • Worktree subagents & 1M-context reasoning |
+| **Claude Code (`claude`)** | Frontier CLI & API | `claude-sonnet-4-6` | `claude -p --output-format stream-json` & Anthropic Messages API • Deep module boundaries & adversarial review |
+| **OpenAI Codex (`codex`)** | Frontier CLI & API | `gpt-5.3-codex` | `codex exec --json --full-auto` & OpenAI API • Sandboxed execution & low-latency surgical patching |
+| **GitHub Copilot (`copilot`)** | Frontier CLI & API | `claude-sonnet-4.5` | `copilot -p --output-format json --allow-all` & GitHub Models API • Repository & PR/Actions workflow integration |
+| **Cursor Agent (`cursor`)** | Frontier CLI Agent | `claude-4.5-sonnet` | `cursor-agent -p --output-format stream-json --force` • Multi-file composer & semantic codebase indexing |
+| **OpenCode (`opencode`)** | Open-Source CLI | `claude-sonnet-4-5` | `opencode run --format json` • LSP-guided terminal coding agent & 75+ provider router |
+| **Aider (`aider`)** | Open-Source CLI | `claude-sonnet-4-6` | `aider --message --yes-always` • Tree-sitter repository map, Architect/Editor split & auto-commit |
+| **Block Goose (`goose`)** | Open-Source CLI | `claude-sonnet-4-5` | `goose run --text --no-session` • Autonomous MCP extension orchestration & YAML recipes |
+| **Charm Crush (`crush`)** | Open-Source CLI | `claude-sonnet-4-5` | `crush run --yolo --quiet` • Fast Go terminal coding harness with multi-provider LSP context |
+| **Sourcegraph Amp (`amp`)** | Specialized CLI | `smart` | `amp -x --stream-json --dangerously-allow-all` • Deep code-graph context & parallel Oracle subagents |
+| **Factory Droid (`droid`)** | Specialized CLI | `claude-opus-4-6` | `droid exec -o stream-json --auto high` • Enterprise autonomous engineering & CI/CD remediation |
+| **Qwen Code (`qwen`)** | Specialized CLI & API | `qwen3-coder-plus` | `qwen -p --output-format stream-json --yolo` & DashScope API • Polyglot agentic coding |
+| **Continue CLI (`continue`)** | Specialized CLI | `claude-sonnet-4-5` | `cn -p --allow * --silent` • Headless continuous AI checks & rule enforcement |
+| **Cline CLI (`cline`)** | Specialized CLI | `claude-sonnet-4-5` | `cline --auto-approve true` • Dual-phase Plan/Act autonomous coding & MCP execution |
+| **DeepSeek (`deepseek`)** | Model API | `deepseek-reasoner` | DeepSeek API (`api.deepseek.com`) • First-principles R1/V3.2 algorithmic reasoning |
+| **Kimi / Moonshot (`kimi`)** | Model API | `kimi-k2.5` | Moonshot API (`api.moonshot.ai/v1`) • 256K-context cross-repository synthesis |
+| **xAI Grok (`grok`)** | Model API | `grok-code-fast-1` | xAI API (`api.x.ai/v1`) • Real-time systems reasoning & low-latency agentic coding |
+| **Mistral / Vibe (`mistral`)** | CLI & Model API | `codestral-latest` | `vibe -p --auto-approve` & Mistral API (`api.mistral.ai/v1`) •SWE-bench Devstral & Codestral FIM |
+| **Local Ollama (`ollama`)** | Local Inference | `qwen2.5-coder:32b` | `ollama run` & Local HTTP (`127.0.0.1:11434/v1`) • Zero-telemetry air-gapped local coding models |
+| **OpenRouter (`openrouter`)** | Unified Gateway | `anthropic/claude-sonnet-4.6` | OpenRouter API (`openrouter.ai/api/v1`) • Single-key routing across 300+ frontier & open-weight models |
+
+See [`docs/research/coding-agents-ecosystem.md`](./docs/research/coding-agents-ecosystem.md) and [`docs/research/muse-cli.md`](./docs/research/muse-cli.md) for the full primary-source CLI flag matrix, JSONL wire schemas, and authentication architecture.
 
 ### Execution Modes
 

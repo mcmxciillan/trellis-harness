@@ -4,12 +4,27 @@
   const PROVIDER_COLORS = {
     antigravity: "#A8202A", // Pomegranate Crimson
     jev: "#2D4A3E",         // Deep Laurel Green
+    gemini: "#1A73E8",      // Google Cobalt Blue
     muse: "#0064E0",        // Meta Royal Azure
     claude: "#9E472A",      // Burnt Umber
     codex: "#2D4A3E",       // Deep Laurel Green
     copilot: "#4A6B5D",     // Laurel Slate
+    cursor: "#3B4252",      // Nordic Slate
+    opencode: "#2E7D6B",    // Verdigris Pine
+    aider: "#2A6F4E",       // Forest Emerald
+    goose: "#6B4E2E",       // Warm Bronze
+    amp: "#D64527",         // Sourcegraph Vermilion
+    droid: "#3E4C59",       // Industrial Iron
+    qwen: "#5B3FD3",        // Qwen Indigo
+    continue: "#3A6073",    // Steel Blue
+    cline: "#7A4988",       // Plum Violet
+    crush: "#C23B6E",       // Charm Magenta
     deepseek: "#4A6B5D",    // Laurel Slate
     kimi: "#A8202A",        // Pomegranate Crimson
+    grok: "#262420",        // Espresso Obsidian
+    mistral: "#D96B27",     // Mistral Ochre
+    ollama: "#52616B",      // Local Granite
+    openrouter: "#4B5D67",  // Gateway Slate
   };
 
   const state = {
@@ -140,12 +155,20 @@
   keysForm.addEventListener("submit", () => {
     const api_keys = {
       jev: document.getElementById("key-jev")?.value.trim() || "",
+      gemini: document.getElementById("key-gemini")?.value.trim() || "",
       muse: document.getElementById("key-muse")?.value.trim() || "",
-      claude: document.getElementById("key-claude").value.trim(),
-      codex: document.getElementById("key-codex").value.trim(),
-      deepseek: document.getElementById("key-deepseek").value.trim(),
-      kimi: document.getElementById("key-kimi").value.trim(),
-      copilot: document.getElementById("key-copilot").value.trim(),
+      claude: document.getElementById("key-claude")?.value.trim() || "",
+      codex: document.getElementById("key-codex")?.value.trim() || "",
+      copilot: document.getElementById("key-copilot")?.value.trim() || "",
+      cursor: document.getElementById("key-cursor")?.value.trim() || "",
+      amp: document.getElementById("key-amp")?.value.trim() || "",
+      droid: document.getElementById("key-droid")?.value.trim() || "",
+      qwen: document.getElementById("key-qwen")?.value.trim() || "",
+      deepseek: document.getElementById("key-deepseek")?.value.trim() || "",
+      kimi: document.getElementById("key-kimi")?.value.trim() || "",
+      grok: document.getElementById("key-grok")?.value.trim() || "",
+      mistral: document.getElementById("key-mistral")?.value.trim() || "",
+      openrouter: document.getElementById("key-openrouter")?.value.trim() || "",
     };
     sendCommand({ command: "SET_API_KEYS", api_keys });
   });

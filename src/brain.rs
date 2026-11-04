@@ -753,6 +753,78 @@ pub fn get_installed_skills() -> Vec<SkillItem> {
         &mut skills,
         &mut seen,
     );
+    scan_skills_dir(
+        &home.join(".claude").join("skills"),
+        "claude-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".codex").join("skills"),
+        "codex-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".copilot").join("skills"),
+        "copilot-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".cursor").join("skills"),
+        "cursor-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".config").join("opencode").join("skills"),
+        "opencode-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".config").join("goose").join("skills"),
+        "goose-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".config").join("amp").join("skills"),
+        "amp-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".factory").join("skills"),
+        "droid-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".qwen").join("skills"),
+        "qwen-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".continue").join("skills"),
+        "continue-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".cline").join("skills"),
+        "cline-skills",
+        &mut skills,
+        &mut seen,
+    );
+    scan_skills_dir(
+        &home.join(".config").join("crush").join("skills"),
+        "crush-skills",
+        &mut skills,
+        &mut seen,
+    );
 
     // Also scan plugin skills under ~/.gemini/config/plugins/*/skills
     let plugins_dir = gemini.join("config").join("plugins");

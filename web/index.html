@@ -209,33 +209,67 @@
 
       <details class="capability-inspect-details" open>
         <summary style="margin-bottom: 8px;">🔑 Configure Runtime API Keys (Optional)</summary>
-        <div class="key-field">
-          <label for="key-jev">Jev • TypeSafe System-1 (JEV_API_KEY / TYPESAFE_API_KEY)</label>
-          <input id="key-jev" type="password" placeholder="tsai-..." />
-        </div>
-        <div class="key-field">
-          <label for="key-muse">Meta Muse Code / Model API (META_API_KEY / MODEL_API_KEY)</label>
-          <input id="key-muse" type="password" placeholder="LLM_..." />
-        </div>
-        <div class="key-field">
-          <label for="key-claude">Claude (ANTHROPIC_API_KEY)</label>
-          <input id="key-claude" type="password" placeholder="sk-ant-..." />
-        </div>
-        <div class="key-field">
-          <label for="key-codex">OpenAI Codex (OPENAI_API_KEY)</label>
-          <input id="key-codex" type="password" placeholder="sk-proj-..." />
-        </div>
-        <div class="key-field">
-          <label for="key-deepseek">DeepSeek (DEEPSEEK_API_KEY)</label>
-          <input id="key-deepseek" type="password" placeholder="sk-..." />
-        </div>
-        <div class="key-field">
-          <label for="key-kimi">Kimi / Moonshot (MOONSHOT_API_KEY)</label>
-          <input id="key-kimi" type="password" placeholder="sk-..." />
-        </div>
-        <div class="key-field">
-          <label for="key-copilot">GitHub Copilot / Models (GITHUB_TOKEN)</label>
-          <input id="key-copilot" type="password" placeholder="ghp_..." />
+        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; max-block-size: 240px; overflow-y: auto; padding-right: 4px;">
+          <div class="key-field">
+            <label for="key-jev">Jev • TypeSafe System-1 (JEV_API_KEY)</label>
+            <input id="key-jev" type="password" placeholder="tsai-..." />
+          </div>
+          <div class="key-field">
+            <label for="key-gemini">Google Gemini (GEMINI_API_KEY)</label>
+            <input id="key-gemini" type="password" placeholder="AIza..." />
+          </div>
+          <div class="key-field">
+            <label for="key-muse">Meta Muse / Model API (META_API_KEY)</label>
+            <input id="key-muse" type="password" placeholder="LLM_..." />
+          </div>
+          <div class="key-field">
+            <label for="key-claude">Claude (ANTHROPIC_API_KEY)</label>
+            <input id="key-claude" type="password" placeholder="sk-ant-..." />
+          </div>
+          <div class="key-field">
+            <label for="key-codex">OpenAI Codex (OPENAI_API_KEY)</label>
+            <input id="key-codex" type="password" placeholder="sk-proj-..." />
+          </div>
+          <div class="key-field">
+            <label for="key-copilot">GitHub Copilot (GITHUB_TOKEN)</label>
+            <input id="key-copilot" type="password" placeholder="ghp_..." />
+          </div>
+          <div class="key-field">
+            <label for="key-cursor">Cursor Agent (CURSOR_API_KEY)</label>
+            <input id="key-cursor" type="password" placeholder="cur_..." />
+          </div>
+          <div class="key-field">
+            <label for="key-amp">Sourcegraph Amp (AMP_API_KEY)</label>
+            <input id="key-amp" type="password" placeholder="sgp_..." />
+          </div>
+          <div class="key-field">
+            <label for="key-droid">Factory Droid (FACTORY_API_KEY)</label>
+            <input id="key-droid" type="password" placeholder="fk-..." />
+          </div>
+          <div class="key-field">
+            <label for="key-qwen">Qwen / DashScope (DASHSCOPE_API_KEY)</label>
+            <input id="key-qwen" type="password" placeholder="sk-..." />
+          </div>
+          <div class="key-field">
+            <label for="key-deepseek">DeepSeek (DEEPSEEK_API_KEY)</label>
+            <input id="key-deepseek" type="password" placeholder="sk-..." />
+          </div>
+          <div class="key-field">
+            <label for="key-kimi">Kimi / Moonshot (MOONSHOT_API_KEY)</label>
+            <input id="key-kimi" type="password" placeholder="sk-..." />
+          </div>
+          <div class="key-field">
+            <label for="key-grok">xAI Grok (XAI_API_KEY)</label>
+            <input id="key-grok" type="password" placeholder="xai-..." />
+          </div>
+          <div class="key-field">
+            <label for="key-mistral">Mistral / Codestral (MISTRAL_API_KEY)</label>
+            <input id="key-mistral" type="password" placeholder="mis_..." />
+          </div>
+          <div class="key-field">
+            <label for="key-openrouter">OpenRouter (OPENROUTER_API_KEY)</label>
+            <input id="key-openrouter" type="password" placeholder="sk-or-v1-..." />
+          </div>
         </div>
 
         <div style="display: flex; gap: 8px; margin-top: 12px;">
@@ -350,6 +384,6 @@
     </form>
   </dialog>
 
-  <script src="/app.js?v=20261103c"></script>
+  <script src="/app.js?v=20261103d"></script>
 </body>
 </html>

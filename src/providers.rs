@@ -75,12 +75,27 @@ pub fn resolve_api_model_name(provider_id: &str, requested_model: &str) -> Strin
     match provider_id {
         "antigravity" => "gemini-4-argon".to_string(),
         "jev" => "jev-latest".to_string(),
+        "gemini" => "gemini-2.5-pro".to_string(),
         "muse" => "muse-spark-1.3".to_string(),
         "claude" => "claude-4-sonnet".to_string(),
         "codex" => "codex-mini-latest".to_string(),
         "copilot" => "copilot-gpt-4o".to_string(),
+        "cursor" => "claude-4-sonnet".to_string(),
+        "opencode" => "anthropic/claude-sonnet-4-5".to_string(),
+        "aider" => "claude-3-7-sonnet-latest".to_string(),
+        "goose" => "claude-sonnet-4-5".to_string(),
+        "amp" => "smart".to_string(),
+        "droid" => "claude-sonnet-4-20250514".to_string(),
+        "qwen" => "qwen3-coder-plus".to_string(),
+        "continue" => "claude-3-7-sonnet".to_string(),
+        "cline" => "claude-sonnet-4-20250514".to_string(),
+        "crush" => "claude-sonnet-4-5".to_string(),
         "deepseek" => "deepseek-chat".to_string(),
         "kimi" => "kimi-k2-5".to_string(),
+        "grok" => "grok-code-fast-1".to_string(),
+        "mistral" => "codestral-latest".to_string(),
+        "ollama" => "qwen3-coder".to_string(),
+        "openrouter" => "anthropic/claude-sonnet-4".to_string(),
         _ => "gpt-4o".to_string(),
     }
 }
@@ -761,6 +776,9 @@ pub fn parse_agy_stream_json_line(line: &str, active_project: &str) -> Option<Ag
     if val.get("payload_type").is_some() {
         return parse_muse_stream_json_line(trimmed, active_project);
     }
+    if val.get("event").is_none() && val.get("type").is_some() {
+        return parse_universal_cli_json_line(&val, active_project);
+    }
     let ev_type = val.get("event")?.as_str()?;
 
     match ev_type {
@@ -924,12 +942,393 @@ pub fn parse_agy_stream_json_line(line: &str, active_project: &str) -> Option<Ag
     }
 }
 
+/// Normalizes JSONL stream events from `claude`, `gemini`, `codex`, `copilot`, `cursor-agent`,
+/// `opencode`, `amp`, `droid`, `qwen`, and `goose` into the unified `AgyParsedEvent` enum.
+pub fn parse_universal_cli_json_line(val: &Value, active_project: &str) -> Option<AgyParsedEvent> {
+    let ev_type = val.get("type")?.as_str()?;
+
+    match ev_type {
+        // 1. Session Initialization (gemini `init`, claude/amp/cursor `system`, codex `thread.started`, copilot `session.start`, opencode `step_start`)
+        "init" | "system" | "thread.started" | "session.start" | "step_start" => {
+            if ev_type == "system" {
+                let subtype = val.get("subtype").and_then(|v| v.as_str()).unwrap_or("init");
+                if subtype != "init" {
+                    return None;
+                }
+            }
+            let cid = val
+                .get("session_id")
+                .or_else(|| val.get("thread_id"))
+                .or_else(|| val.get("sessionID"))
+                .or_else(|| val.get("data").and_then(|d| d.get("sessionId")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if cid.is_empty() {
+                None
+            } else {
+                Some(AgyParsedEvent::Init {
+                    conversation_id: cid,
+                })
+            }
+        }
+        // 2. Gemini / Qwen / Droid `message` delta (`{"type":"message","role":"assistant","content":"...","delta":true}`)
+        "message" => {
+            let role = val.get("role").and_then(|v| v.as_str()).unwrap_or("assistant");
+            if role != "assistant" {
+                return None;
+            }
+            let delta = val
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if delta.is_empty() {
+                None
+            } else {
+                Some(AgyParsedEvent::TextDelta {
+                    step_index: 1,
+                    delta,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                })
+            }
+        }
+        // 3. Claude / Amp / Cursor `assistant` turn (`{"type":"assistant","message":{"content":[...],"usage":{...}}}`)
+        "assistant" => {
+            let msg = val.get("message").unwrap_or(val);
+            let usage = msg.get("usage");
+            let input_tokens = usage
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|v| v.as_u64());
+            let output_tokens = usage
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|v| v.as_u64());
+            let cache_read_tokens = usage
+                .and_then(|u| {
+                    u.get("cache_read_input_tokens")
+                        .or_else(|| u.get("cache_read_tokens"))
+                })
+                .and_then(|v| v.as_u64());
+
+            if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+                for item in arr {
+                    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if item_type == "tool_use" {
+                        let raw_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                        let tool_name = normalize_cli_tool_name(raw_name);
+                        let summary = extract_tool_summary(item.get("input"), active_project);
+                        return Some(AgyParsedEvent::ToolActive {
+                            step_index: 1,
+                            tool_name,
+                            summary,
+                            questions: Vec::new(),
+                        });
+                    }
+                }
+                let mut combined = String::new();
+                for item in arr {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                        if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                            combined.push_str(t);
+                        }
+                    }
+                }
+                if !combined.is_empty() || input_tokens.is_some() {
+                    return Some(AgyParsedEvent::TextDelta {
+                        step_index: 1,
+                        delta: combined,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                    });
+                }
+            }
+            None
+        }
+        // 4. Copilot `assistant.message` or OpenCode `text`
+        "assistant.message" | "text" => {
+            let delta = val
+                .get("data")
+                .and_then(|d| d.get("content"))
+                .or_else(|| val.get("part").and_then(|p| p.get("text")))
+                .or_else(|| val.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if delta.is_empty() {
+                None
+            } else {
+                Some(AgyParsedEvent::TextDelta {
+                    step_index: 1,
+                    delta,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                })
+            }
+        }
+        // 5. Tool Start across Gemini (`tool_use`), Cursor (`tool_call`), Copilot (`tool.execution_start`), OpenCode (`tool_use`)
+        "tool_use" | "tool_call" | "tool.execution_start" => {
+            if let Some(tc_obj) = val.get("tool_call").and_then(|v| v.as_object()) {
+                if let Some((first_key, inner)) = tc_obj.iter().next() {
+                    let tool_name = normalize_cli_tool_name(first_key);
+                    let summary = extract_tool_summary(inner.get("args"), active_project);
+                    return Some(AgyParsedEvent::ToolActive {
+                        step_index: 1,
+                        tool_name,
+                        summary,
+                        questions: Vec::new(),
+                    });
+                }
+            }
+            let raw_name = val
+                .get("tool_name")
+                .or_else(|| val.get("tool"))
+                .or_else(|| val.get("name"))
+                .or_else(|| val.get("data").and_then(|d| d.get("toolName")))
+                .or_else(|| val.get("part").and_then(|p| p.get("tool")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool");
+            let tool_name = normalize_cli_tool_name(raw_name);
+            let params = val
+                .get("parameters")
+                .or_else(|| val.get("arguments"))
+                .or_else(|| val.get("input"))
+                .or_else(|| val.get("data").and_then(|d| d.get("arguments")))
+                .or_else(|| {
+                    val.get("part")
+                        .and_then(|p| p.get("state"))
+                        .and_then(|s| s.get("input"))
+                });
+            let summary = extract_tool_summary(params, active_project);
+            Some(AgyParsedEvent::ToolActive {
+                step_index: 1,
+                tool_name,
+                summary,
+                questions: Vec::new(),
+            })
+        }
+        // 6. Tool Done across Gemini (`tool_result`), Copilot (`tool.execution_complete`)
+        "tool_result" | "tool.execution_complete" => {
+            let raw_name = val
+                .get("tool_name")
+                .or_else(|| val.get("data").and_then(|d| d.get("toolName")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool");
+            Some(AgyParsedEvent::ToolDone {
+                step_index: 1,
+                tool_name: normalize_cli_tool_name(raw_name),
+            })
+        }
+        // 7. Codex `item.started` / `item.completed`
+        "item.started" => {
+            let item = val.get("item")?;
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if item_type == "command_execution"
+                || item_type == "mcp_tool_call"
+                || item_type == "file_change"
+            {
+                let tool_name = match item_type {
+                    "command_execution" => "run_command".to_string(),
+                    "file_change" => "edit_file".to_string(),
+                    _ => item
+                        .get("tool")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("mcp_tool")
+                        .to_string(),
+                };
+                let summary = item
+                    .get("command")
+                    .or_else(|| item.get("path"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.chars().take(72).collect())
+                    .unwrap_or_else(|| format!("~/code/{}", active_project));
+                Some(AgyParsedEvent::ToolActive {
+                    step_index: 1,
+                    tool_name,
+                    summary,
+                    questions: Vec::new(),
+                })
+            } else {
+                None
+            }
+        }
+        "item.completed" => {
+            let item = val.get("item")?;
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if item_type == "agent_message" {
+                let text = item
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(AgyParsedEvent::TextDelta {
+                        step_index: 1,
+                        delta: text,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cache_read_tokens: None,
+                    })
+                }
+            } else if item_type == "command_execution" || item_type == "file_change" {
+                let tool_name = if item_type == "command_execution" {
+                    "run_command".to_string()
+                } else {
+                    "edit_file".to_string()
+                };
+                Some(AgyParsedEvent::ToolDone {
+                    step_index: 1,
+                    tool_name,
+                })
+            } else {
+                None
+            }
+        }
+        // 8. Final Result across Claude/Amp/Cursor (`result`), Gemini/Qwen (`result`), Codex (`turn.completed`), Copilot (`workflow.result`), OpenCode (`step_finish`)
+        "result" | "turn.completed" | "workflow.result" | "step_finish" => {
+            let cid = val
+                .get("session_id")
+                .or_else(|| val.get("conversation_id"))
+                .or_else(|| val.get("sessionID"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let response = val
+                .get("result")
+                .and_then(|v| v.as_str())
+                .or_else(|| val.get("response").and_then(|v| v.as_str()))
+                .or_else(|| val.get("data").and_then(|d| d.get("content")).and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let usage = val
+                .get("usage")
+                .or_else(|| val.get("stats"))
+                .or_else(|| val.get("part").and_then(|p| p.get("tokens")));
+            let input_tokens = usage
+                .and_then(|u| u.get("input_tokens").or_else(|| u.get("input")))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let output_tokens = usage
+                .and_then(|u| u.get("output_tokens").or_else(|| u.get("output")))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cache_read_tokens = usage
+                .and_then(|u| {
+                    u.get("cache_read_tokens")
+                        .or_else(|| u.get("cache_read_input_tokens"))
+                        .or_else(|| u.get("cached_input_tokens"))
+                        .or_else(|| u.get("cached"))
+                        .or_else(|| u.get("cache").and_then(|c| c.get("read")))
+                })
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            Some(AgyParsedEvent::Result {
+                conversation_id: cid,
+                response,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn normalize_cli_tool_name(raw: &str) -> String {
+    let lower = raw.trim().to_lowercase();
+    if lower == "view_file"
+        || lower == "read"
+        || lower == "read_file"
+        || lower == "view"
+        || lower == "readtoolcall"
+    {
+        "read_file".to_string()
+    } else if lower == "replace_file_content"
+        || lower == "multi_replace_file_content"
+        || lower == "edit"
+        || lower == "edit_file"
+        || lower == "str_replace_editor"
+        || lower == "edittoolcall"
+    {
+        "edit_file".to_string()
+    } else if lower == "write_to_file"
+        || lower == "write"
+        || lower == "create_file"
+        || lower == "writetoolcall"
+    {
+        "write_file".to_string()
+    } else if lower == "bash"
+        || lower == "shell"
+        || lower == "run_shell_command"
+        || lower == "run_command"
+        || lower == "shelltoolcall"
+    {
+        "run_command".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+fn extract_tool_summary(params: Option<&Value>, active_project: &str) -> String {
+    let raw_summary = params
+        .and_then(|p| {
+            p.get("toolSummary")
+                .or_else(|| p.get("command"))
+                .or_else(|| p.get("CommandLine"))
+                .or_else(|| p.get("path"))
+                .or_else(|| p.get("file_path"))
+                .or_else(|| p.get("filePath"))
+                .or_else(|| p.get("Path"))
+                .or_else(|| p.get("TargetFile"))
+                .or_else(|| p.get("pattern"))
+                .or_else(|| p.get("query"))
+        })
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_matches('"').to_string())
+        .unwrap_or_else(|| format!("~/code/{}", active_project));
+    let code_prefix = format!("{}/code/", home_dir().to_string_lossy());
+    let proj_prefix = format!("{}{}/", code_prefix, active_project);
+    raw_summary
+        .replace(&proj_prefix, "")
+        .replace(&code_prefix, "")
+        .chars()
+        .take(80)
+        .collect()
+}
+
 pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<ProviderInfo> {
     let agy_bin = detect_binary(&["agy"]);
+    let gemini_bin = detect_binary(&["/opt/homebrew/bin/gemini", "/usr/local/bin/gemini", "gemini"]);
     let muse_bin = detect_binary(&["/opt/homebrew/bin/muse", "muse"]).or_else(|| agy_bin.clone());
     let claude_bin = detect_binary(&["/opt/homebrew/bin/claude", "claude"]).or_else(|| agy_bin.clone());
     let codex_bin = detect_binary(&["/opt/homebrew/bin/codex", "codex"]).or_else(|| agy_bin.clone());
-    let gh_bin = detect_binary(&["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "gh"]);
+    let copilot_bin = detect_binary(&[
+        "/opt/homebrew/bin/copilot",
+        "/usr/local/bin/copilot",
+        "copilot",
+        "/opt/homebrew/bin/gh",
+        "/usr/local/bin/gh",
+        "gh",
+    ]);
+    let cursor_bin = detect_binary(&["/opt/homebrew/bin/cursor-agent", "cursor-agent", "agent"]);
+    let opencode_bin = detect_binary(&["/opt/homebrew/bin/opencode", "opencode"]);
+    let aider_bin = detect_binary(&["/opt/homebrew/bin/aider", "aider"]);
+    let goose_bin = detect_binary(&["/opt/homebrew/bin/goose", "goose"]);
+    let amp_bin = detect_binary(&["/opt/homebrew/bin/amp", "amp"]);
+    let droid_bin = detect_binary(&["/opt/homebrew/bin/droid", "droid"]);
+    let qwen_bin = detect_binary(&["/opt/homebrew/bin/qwen", "qwen"]);
+    let continue_bin = detect_binary(&["/opt/homebrew/bin/cn", "cn"]);
+    let cline_bin = detect_binary(&["/opt/homebrew/bin/cline", "cline"]);
+    let crush_bin = detect_binary(&["/opt/homebrew/bin/crush", "crush"]);
+    let vibe_bin = detect_binary(&["/opt/homebrew/bin/vibe", "vibe"]);
+    let ollama_bin = detect_binary(&["/opt/homebrew/bin/ollama", "/usr/local/bin/ollama", "ollama"]);
 
     let has_key = |env_names: &[&str], id: &str| -> bool {
         if let Some(k) = api_keys.get(id) {
@@ -945,12 +1344,36 @@ pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<Provid
     };
 
     let agy_key = has_key(&["GEMINI_API_KEY", "GOOGLE_API_KEY"], "antigravity");
+    let gemini_key = has_key(&["GEMINI_API_KEY", "GOOGLE_API_KEY"], "gemini");
     let muse_key = has_key(&["META_API_KEY", "MODEL_API_KEY"], "muse");
-    let claude_key = has_key(&["ANTHROPIC_API_KEY"], "claude");
-    let codex_key = has_key(&["OPENAI_API_KEY"], "codex");
-    let copilot_key = has_key(&["GITHUB_TOKEN", "GH_TOKEN"], "copilot");
+    let claude_key = has_key(&["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"], "claude");
+    let codex_key = has_key(&["CODEX_API_KEY", "OPENAI_API_KEY"], "codex");
+    let copilot_key = has_key(&["COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"], "copilot");
+    let cursor_key = has_key(&["CURSOR_API_KEY"], "cursor");
+    let opencode_key = has_key(
+        &["OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+        "opencode",
+    );
+    let aider_key = has_key(
+        &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"],
+        "aider",
+    );
+    let goose_key = has_key(
+        &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"],
+        "goose",
+    );
+    let amp_key = has_key(&["AMP_API_KEY"], "amp");
+    let droid_key = has_key(&["FACTORY_API_KEY"], "droid");
+    let qwen_key = has_key(&["DASHSCOPE_API_KEY", "QWEN_CODE_API_KEY"], "qwen");
+    let continue_key = has_key(&["CONTINUE_API_KEY"], "continue");
+    let cline_key = has_key(&["OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"], "cline");
+    let crush_key = has_key(&["ANTHROPIC_API_KEY", "OPENAI_API_KEY"], "crush");
     let deepseek_key = has_key(&["DEEPSEEK_API_KEY"], "deepseek");
     let kimi_key = has_key(&["MOONSHOT_API_KEY", "KIMI_API_KEY"], "kimi");
+    let grok_key = has_key(&["XAI_API_KEY"], "grok");
+    let mistral_key = has_key(&["MISTRAL_API_KEY", "CODESTRAL_API_KEY"], "mistral");
+    let ollama_key = has_key(&["OLLAMA_HOST"], "ollama");
+    let openrouter_key = has_key(&["OPENROUTER_API_KEY"], "openrouter");
     let jev_key = has_key(&["JEV_API_KEY", "TYPESAFE_API_KEY"], "jev");
 
     let mode_for = |bin: &Option<String>, key: bool| -> String {
@@ -1005,6 +1428,24 @@ pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<Provid
             enabled_in_council: true,
         },
         ProviderInfo {
+            id: "gemini".to_string(),
+            name: "Google Gemini CLI (gemini)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "1M-Context Multimodal Repo Exploration, Worktrees & Policy Engine".to_string(),
+            default_model: "gemini-2.5-pro".to_string(),
+            available_models: vec![
+                "gemini-2.5-pro".to_string(),
+                "gemini-2.5-flash".to_string(),
+                "gemini-3-pro-preview".to_string(),
+            ],
+            color: "#1A73E8".to_string(),
+            icon: "♊".to_string(),
+            mode: mode_for(&gemini_bin, gemini_key),
+            cli_path: gemini_bin,
+            has_api_key: gemini_key,
+            enabled_in_council: true,
+        },
+        ProviderInfo {
             id: "muse".to_string(),
             name: "Meta Muse Code (muse)".to_string(),
             model_class: "GENERATIVE_SYSTEM_2".to_string(),
@@ -1027,7 +1468,7 @@ pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<Provid
         },
         ProviderInfo {
             id: "claude".to_string(),
-            name: "Claude Code".to_string(),
+            name: "Claude Code (claude)".to_string(),
             model_class: "GENERATIVE_SYSTEM_2".to_string(),
             task_specialty: "Deep Module Design, Boundary Invariants & Adversarial Review".to_string(),
             default_model: "claude-4-sonnet".to_string(),
@@ -1045,12 +1486,13 @@ pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<Provid
         },
         ProviderInfo {
             id: "codex".to_string(),
-            name: "OpenAI Codex".to_string(),
+            name: "OpenAI Codex CLI (codex)".to_string(),
             model_class: "GENERATIVE_SYSTEM_2".to_string(),
-            task_specialty: "Low-Latency Code Synthesis & Surgical Patching".to_string(),
+            task_specialty: "Low-Latency Code Synthesis, Seatbelt Sandbox & Surgical Patching".to_string(),
             default_model: "codex-mini-latest".to_string(),
             available_models: vec![
                 "codex-mini-latest".to_string(),
+                "gpt-5.4".to_string(),
                 "gpt-4o".to_string(),
                 "o3-mini".to_string(),
             ],
@@ -1063,19 +1505,197 @@ pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<Provid
         },
         ProviderInfo {
             id: "copilot".to_string(),
-            name: "GitHub Copilot".to_string(),
+            name: "GitHub Copilot CLI (copilot)".to_string(),
             model_class: "GENERATIVE_SYSTEM_2".to_string(),
-            task_specialty: "CLI Workflow Automation & PR/Issue Integration".to_string(),
+            task_specialty: "Fleet Subagent Orchestration, GitHub MCP & PR/Issue Automation".to_string(),
             default_model: "copilot-gpt-4o".to_string(),
             available_models: vec![
                 "copilot-gpt-4o".to_string(),
+                "gpt-5.4".to_string(),
+                "claude-sonnet-4.5".to_string(),
                 "copilot-claude-sonnet".to_string(),
             ],
             color: "#4A6B5D".to_string(),
             icon: "🟣".to_string(),
-            mode: mode_for(&gh_bin, copilot_key),
-            cli_path: gh_bin,
+            mode: mode_for(&copilot_bin, copilot_key),
+            cli_path: copilot_bin,
             has_api_key: copilot_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "cursor".to_string(),
+            name: "Cursor Agent CLI (cursor-agent)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Fast Multi-File Refactoring, `.cursor/rules` & IDE Parity".to_string(),
+            default_model: "claude-4-sonnet".to_string(),
+            available_models: vec![
+                "claude-4-sonnet".to_string(),
+                "gpt-5".to_string(),
+                "cursor-fast".to_string(),
+            ],
+            color: "#3B4252".to_string(),
+            icon: "🖱️".to_string(),
+            mode: mode_for(&cursor_bin, cursor_key),
+            cli_path: cursor_bin,
+            has_api_key: cursor_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "opencode".to_string(),
+            name: "OpenCode (opencode)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Open-Source Terminal Coding Agent, LSP Diagnostics & Session Forking".to_string(),
+            default_model: "anthropic/claude-sonnet-4-5".to_string(),
+            available_models: vec![
+                "anthropic/claude-sonnet-4-5".to_string(),
+                "openai/gpt-4o".to_string(),
+                "google/gemini-2.5-pro".to_string(),
+            ],
+            color: "#5E81AC".to_string(),
+            icon: "🔓".to_string(),
+            mode: mode_for(&opencode_bin, opencode_key),
+            cli_path: opencode_bin,
+            has_api_key: opencode_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "aider".to_string(),
+            name: "Aider (aider)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Tree-Sitter Repo Map, Architect/Editor Dual-Model & Auto-Lint/Test".to_string(),
+            default_model: "claude-3-7-sonnet-latest".to_string(),
+            available_models: vec![
+                "claude-3-7-sonnet-latest".to_string(),
+                "deepseek/deepseek-chat".to_string(),
+                "gpt-4o".to_string(),
+            ],
+            color: "#2E7D32".to_string(),
+            icon: "🛠️".to_string(),
+            mode: mode_for(&aider_bin, aider_key),
+            cli_path: aider_bin,
+            has_api_key: aider_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "goose".to_string(),
+            name: "Block Goose (goose)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Extensible MCP Developer Agent & Declarative YAML Recipes".to_string(),
+            default_model: "claude-sonnet-4-5".to_string(),
+            available_models: vec![
+                "claude-sonnet-4-5".to_string(),
+                "gpt-4o".to_string(),
+                "gemini-2.5-pro".to_string(),
+            ],
+            color: "#6D4C41".to_string(),
+            icon: "🪿".to_string(),
+            mode: mode_for(&goose_bin, goose_key),
+            cli_path: goose_bin,
+            has_api_key: goose_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "amp".to_string(),
+            name: "Sourcegraph Amp (amp)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Cross-Repository Code Intelligence, Subagent Oracles & Deep Search".to_string(),
+            default_model: "smart".to_string(),
+            available_models: vec![
+                "smart".to_string(),
+                "deep".to_string(),
+                "rush".to_string(),
+            ],
+            color: "#D84315".to_string(),
+            icon: "🔊".to_string(),
+            mode: mode_for(&amp_bin, amp_key),
+            cli_path: amp_bin,
+            has_api_key: amp_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "droid".to_string(),
+            name: "Factory Droid (droid)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Autonomous CI/CD Engineering, Migration Droids & Tiered Autonomy".to_string(),
+            default_model: "claude-sonnet-4-20250514".to_string(),
+            available_models: vec![
+                "claude-sonnet-4-20250514".to_string(),
+                "openai-latest-balanced".to_string(),
+            ],
+            color: "#37474F".to_string(),
+            icon: "🤖".to_string(),
+            mode: mode_for(&droid_bin, droid_key),
+            cli_path: droid_bin,
+            has_api_key: droid_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "qwen".to_string(),
+            name: "Qwen Code (qwen)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Qwen3-Coder Agentic Tool Loops & Open-Weight Code Synthesis".to_string(),
+            default_model: "qwen3-coder-plus".to_string(),
+            available_models: vec![
+                "qwen3-coder-plus".to_string(),
+                "qwen-max".to_string(),
+                "qwen2.5-coder-32b-instruct".to_string(),
+            ],
+            color: "#512DA8".to_string(),
+            icon: "🟣".to_string(),
+            mode: mode_for(&qwen_bin, qwen_key),
+            cli_path: qwen_bin,
+            has_api_key: qwen_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "continue".to_string(),
+            name: "Continue CLI (cn)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Rule-Governed Headless Checks (`.continue/rules`) & Hub Assistants".to_string(),
+            default_model: "claude-3-7-sonnet".to_string(),
+            available_models: vec![
+                "claude-3-7-sonnet".to_string(),
+                "gpt-4o".to_string(),
+            ],
+            color: "#00838F".to_string(),
+            icon: "▶️".to_string(),
+            mode: mode_for(&continue_bin, continue_key),
+            cli_path: continue_bin,
+            has_api_key: continue_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "cline".to_string(),
+            name: "Cline CLI (cline)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Plan/Act Dual-Phase Agentic Execution & `.clinerules` Enforcement".to_string(),
+            default_model: "claude-sonnet-4-20250514".to_string(),
+            available_models: vec![
+                "claude-sonnet-4-20250514".to_string(),
+                "deepseek-reasoner".to_string(),
+            ],
+            color: "#455A64".to_string(),
+            icon: "🦾".to_string(),
+            mode: mode_for(&cline_bin, cline_key),
+            cli_path: cline_bin,
+            has_api_key: cline_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "crush".to_string(),
+            name: "Charm Crush (crush)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Catwalk Multi-Provider Routing & Fast Terminal Code Generation".to_string(),
+            default_model: "claude-sonnet-4-5".to_string(),
+            available_models: vec![
+                "claude-sonnet-4-5".to_string(),
+                "gpt-4o".to_string(),
+            ],
+            color: "#AD1457".to_string(),
+            icon: "💖".to_string(),
+            mode: mode_for(&crush_bin, crush_key),
+            cli_path: crush_bin,
+            has_api_key: crush_key,
             enabled_in_council: false,
         },
         ProviderInfo {
@@ -1111,6 +1731,82 @@ pub fn build_provider_registry(api_keys: &HashMap<String, String>) -> Vec<Provid
             cli_path: None,
             has_api_key: kimi_key,
             enabled_in_council: true,
+        },
+        ProviderInfo {
+            id: "grok".to_string(),
+            name: "xAI Grok (grok)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "High-Throughput Agentic Coding (`grok-code-fast-1`) & Frontier Reasoning".to_string(),
+            default_model: "grok-code-fast-1".to_string(),
+            available_models: vec![
+                "grok-code-fast-1".to_string(),
+                "grok-4".to_string(),
+                "grok-3-mini".to_string(),
+            ],
+            color: "#263238".to_string(),
+            icon: "✖️".to_string(),
+            mode: mode_for(&None, grok_key),
+            cli_path: None,
+            has_api_key: grok_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "mistral".to_string(),
+            name: "Mistral Codestral / Vibe".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Devstral SWE Agent, Codestral FIM & Mistral Vibe CLI".to_string(),
+            default_model: "codestral-latest".to_string(),
+            available_models: vec![
+                "codestral-latest".to_string(),
+                "devstral-small-latest".to_string(),
+                "mistral-large-latest".to_string(),
+            ],
+            color: "#E65100".to_string(),
+            icon: "🌪️".to_string(),
+            mode: mode_for(&vibe_bin, mistral_key),
+            cli_path: vibe_bin,
+            has_api_key: mistral_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "ollama".to_string(),
+            name: "Local Ollama (ollama)".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Zero-Egress Local Open-Weight Inference (`qwen3-coder`, `devstral`, `muse-glimmer`)".to_string(),
+            default_model: "qwen3-coder".to_string(),
+            available_models: vec![
+                "qwen3-coder".to_string(),
+                "qwen2.5-coder:32b".to_string(),
+                "deepseek-r1:32b".to_string(),
+                "devstral".to_string(),
+                "muse-glimmer".to_string(),
+            ],
+            color: "#33691E".to_string(),
+            icon: "🦙".to_string(),
+            mode: mode_for(&ollama_bin, ollama_key),
+            cli_path: ollama_bin,
+            has_api_key: ollama_key,
+            enabled_in_council: false,
+        },
+        ProviderInfo {
+            id: "openrouter".to_string(),
+            name: "OpenRouter Gateway".to_string(),
+            model_class: "GENERATIVE_SYSTEM_2".to_string(),
+            task_specialty: "Universal Multi-Vendor Model Routing & Failover Gateway".to_string(),
+            default_model: "anthropic/claude-sonnet-4".to_string(),
+            available_models: vec![
+                "anthropic/claude-sonnet-4".to_string(),
+                "x-ai/grok-code-fast-1".to_string(),
+                "mistralai/codestral-latest".to_string(),
+                "qwen/qwen3-coder".to_string(),
+                "openrouter/auto".to_string(),
+            ],
+            color: "#4527A0".to_string(),
+            icon: "🌐".to_string(),
+            mode: mode_for(&None, openrouter_key),
+            cli_path: None,
+            has_api_key: openrouter_key,
+            enabled_in_council: false,
         },
     ]
 }
@@ -1759,32 +2455,243 @@ pub async fn execute_provider_prompt(
                 }
             }
         }
+        "gemini" => {
+            if let Some(key) = resolve_key(api_keys, "gemini", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]) {
+                if !key.is_empty() {
+                    match call_openai_compatible(
+                        &client,
+                        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                        &key,
+                        &api_model,
+                        &contextualized_prompt,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let iqs = maybe_extract_or_synthesize_questions(
+                                prompt,
+                                &text,
+                                active_project,
+                                fast_council_stage,
+                            );
+                            return ProviderResponse {
+                                text,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API".to_string(),
+                                decision_eval: None,
+                                interactive_questions: iqs,
+                            };
+                        }
+                        Err(diag) => {
+                            return ProviderResponse {
+                                text: format!(
+                                    "⚠️ [GEMINI • {}] Live API Error: {}",
+                                    api_model, diag
+                                ),
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API_ERROR".to_string(),
+                                decision_eval: None,
+                                interactive_questions: Vec::new(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        "grok" => {
+            if let Some(key) = resolve_key(api_keys, "grok", &["XAI_API_KEY"]) {
+                if !key.is_empty() {
+                    match call_openai_compatible(
+                        &client,
+                        "https://api.x.ai/v1/chat/completions",
+                        &key,
+                        &api_model,
+                        &contextualized_prompt,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let iqs = maybe_extract_or_synthesize_questions(
+                                prompt,
+                                &text,
+                                active_project,
+                                fast_council_stage,
+                            );
+                            return ProviderResponse {
+                                text,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API".to_string(),
+                                decision_eval: None,
+                                interactive_questions: iqs,
+                            };
+                        }
+                        Err(diag) => {
+                            return ProviderResponse {
+                                text: format!(
+                                    "⚠️ [GROK • {}] Live API Error: {}",
+                                    api_model, diag
+                                ),
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API_ERROR".to_string(),
+                                decision_eval: None,
+                                interactive_questions: Vec::new(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        "mistral" => {
+            if let Some(key) =
+                resolve_key(api_keys, "mistral", &["MISTRAL_API_KEY", "CODESTRAL_API_KEY"])
+            {
+                if !key.is_empty() {
+                    match call_openai_compatible(
+                        &client,
+                        "https://api.mistral.ai/v1/chat/completions",
+                        &key,
+                        &api_model,
+                        &contextualized_prompt,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let iqs = maybe_extract_or_synthesize_questions(
+                                prompt,
+                                &text,
+                                active_project,
+                                fast_council_stage,
+                            );
+                            return ProviderResponse {
+                                text,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API".to_string(),
+                                decision_eval: None,
+                                interactive_questions: iqs,
+                            };
+                        }
+                        Err(diag) => {
+                            return ProviderResponse {
+                                text: format!(
+                                    "⚠️ [MISTRAL • {}] Live API Error: {}",
+                                    api_model, diag
+                                ),
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API_ERROR".to_string(),
+                                decision_eval: None,
+                                interactive_questions: Vec::new(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        "qwen" => {
+            if let Some(key) =
+                resolve_key(api_keys, "qwen", &["DASHSCOPE_API_KEY", "QWEN_CODE_API_KEY"])
+            {
+                if !key.is_empty() {
+                    match call_openai_compatible(
+                        &client,
+                        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+                        &key,
+                        &api_model,
+                        &contextualized_prompt,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let iqs = maybe_extract_or_synthesize_questions(
+                                prompt,
+                                &text,
+                                active_project,
+                                fast_council_stage,
+                            );
+                            return ProviderResponse {
+                                text,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API".to_string(),
+                                decision_eval: None,
+                                interactive_questions: iqs,
+                            };
+                        }
+                        Err(diag) => {
+                            return ProviderResponse {
+                                text: format!(
+                                    "⚠️ [QWEN • {}] Live API Error: {}",
+                                    api_model, diag
+                                ),
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API_ERROR".to_string(),
+                                decision_eval: None,
+                                interactive_questions: Vec::new(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        "openrouter" => {
+            if let Some(key) = resolve_key(api_keys, "openrouter", &["OPENROUTER_API_KEY"]) {
+                if !key.is_empty() {
+                    match call_openai_compatible(
+                        &client,
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        &key,
+                        &api_model,
+                        &contextualized_prompt,
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let iqs = maybe_extract_or_synthesize_questions(
+                                prompt,
+                                &text,
+                                active_project,
+                                fast_council_stage,
+                            );
+                            return ProviderResponse {
+                                text,
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API".to_string(),
+                                decision_eval: None,
+                                interactive_questions: iqs,
+                            };
+                        }
+                        Err(diag) => {
+                            return ProviderResponse {
+                                text: format!(
+                                    "⚠️ [OPENROUTER • {}] Live API Error: {}",
+                                    api_model, diag
+                                ),
+                                latency_ms: start.elapsed().as_millis() as u64,
+                                execution_mode: "LIVE_API_ERROR".to_string(),
+                                decision_eval: None,
+                                interactive_questions: Vec::new(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
 
-    if !fast_council_stage && provider_id == "muse" && is_muse_cli_authenticated(api_keys) {
-        if let Some(muse_bin) = detect_binary(&["/opt/homebrew/bin/muse", "muse"]) {
-            let mut cmd = Command::new(&muse_bin);
-            if let Some(key) = resolve_key(api_keys, "muse", &["META_API_KEY", "MODEL_API_KEY"]) {
-                if !key.is_empty() {
-                    cmd.env("META_API_KEY", key);
-                }
-            }
-            cmd.arg("exec")
-                .arg("--model")
-                .arg(&api_model)
-                .arg("--workspace")
-                .arg(&work_dir)
-                .arg("--trust-workspace")
-                .arg("--disable-approval")
-                .arg("--user-input-auto-resolve")
-                .arg(&contextualized_prompt)
+    if !fast_council_stage {
+        if let Some(mut native_cmd) = build_native_agent_cli_command(
+            provider_id,
+            &api_model,
+            &contextualized_prompt,
+            &work_dir,
+            api_keys,
+        ) {
+            native_cmd
                 .current_dir(&work_dir)
                 .stdin(Stdio::null())
                 .kill_on_drop(true)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let fut = cmd.output();
+            let fut = native_cmd.output();
 
             if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(185), fut).await {
                 let stdout = clean_ansi_and_tags(&String::from_utf8_lossy(&output.stdout));
@@ -1809,6 +2716,7 @@ pub async fn execute_provider_prompt(
 
     if !fast_council_stage
         && (provider_id == "antigravity"
+            || provider_id == "gemini"
             || provider_id == "muse"
             || provider_id == "claude"
             || provider_id == "codex")
@@ -1851,12 +2759,15 @@ pub async fn execute_provider_prompt(
 
     let delay_ms = match provider_id {
         "antigravity" => 260,
+        "gemini" => 245,
         "muse" => 280,
         "claude" => 340,
         "codex" => 210,
         "copilot" => 240,
         "deepseek" => 390,
         "kimi" => 310,
+        "grok" => 230,
+        "mistral" => 255,
         _ => 250,
     };
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -1870,6 +2781,7 @@ pub async fn execute_provider_prompt(
         text,
         latency_ms: start.elapsed().as_millis() as u64,
         execution_mode: if provider_id == "antigravity"
+            || provider_id == "gemini"
             || provider_id == "muse"
             || provider_id == "copilot"
         {
@@ -1879,6 +2791,243 @@ pub async fn execute_provider_prompt(
         },
         decision_eval: None,
         interactive_questions: iqs,
+    }
+}
+
+/// Builds a non-interactive headless `Command` for any installed native CLI coding agent.
+pub fn build_native_agent_cli_command(
+    provider_id: &str,
+    model: &str,
+    prompt: &str,
+    work_dir: &Path,
+    api_keys: &HashMap<String, String>,
+) -> Option<Command> {
+    match provider_id {
+        "muse" => {
+            if !is_muse_cli_authenticated(api_keys) {
+                return None;
+            }
+            let bin = detect_binary(&["/opt/homebrew/bin/muse", "muse"])?;
+            let mut cmd = Command::new(bin);
+            if let Some(key) = resolve_key(api_keys, "muse", &["META_API_KEY", "MODEL_API_KEY"]) {
+                if !key.is_empty() {
+                    cmd.env("META_API_KEY", key);
+                }
+            }
+            cmd.arg("exec")
+                .arg("--model")
+                .arg(model)
+                .arg("--workspace")
+                .arg(work_dir)
+                .arg("--trust-workspace")
+                .arg("--disable-approval")
+                .arg("--user-input-auto-resolve")
+                .arg(prompt);
+            Some(cmd)
+        }
+        "gemini" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/gemini", "/usr/local/bin/gemini", "gemini"])?;
+            let mut cmd = Command::new(bin);
+            if let Some(key) = resolve_key(api_keys, "gemini", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]) {
+                if !key.is_empty() {
+                    cmd.env("GEMINI_API_KEY", key);
+                }
+            }
+            cmd.env("GEMINI_CLI_TRUST_WORKSPACE", "true")
+                .arg("-p")
+                .arg(prompt)
+                .arg("-m")
+                .arg(model)
+                .arg("--approval-mode")
+                .arg("yolo")
+                .arg("--skip-trust");
+            Some(cmd)
+        }
+        "copilot" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/copilot", "/usr/local/bin/copilot", "copilot"])?;
+            let mut cmd = Command::new(bin);
+            if let Some(key) =
+                resolve_key(api_keys, "copilot", &["COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"])
+            {
+                if !key.is_empty() {
+                    cmd.env("COPILOT_GITHUB_TOKEN", key);
+                }
+            }
+            cmd.arg("-p")
+                .arg(prompt)
+                .arg("-s")
+                .arg("--allow-all")
+                .arg("--trust-folder")
+                .arg("--no-ask-user")
+                .arg("-C")
+                .arg(work_dir);
+            Some(cmd)
+        }
+        "cursor" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/cursor-agent", "cursor-agent"])?;
+            let mut cmd = Command::new(bin);
+            if let Some(key) = resolve_key(api_keys, "cursor", &["CURSOR_API_KEY"]) {
+                if !key.is_empty() {
+                    cmd.env("CURSOR_API_KEY", key);
+                }
+            }
+            cmd.arg("-p")
+                .arg(prompt)
+                .arg("--force")
+                .arg("--model")
+                .arg(model)
+                .arg("--workspace")
+                .arg(work_dir);
+            Some(cmd)
+        }
+        "opencode" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/opencode", "opencode"])?;
+            let mut cmd = Command::new(bin);
+            cmd.env("OPENCODE_DISABLE_AUTOUPDATE", "1")
+                .arg("run")
+                .arg(prompt)
+                .arg("--model")
+                .arg(model)
+                .arg("--auto");
+            Some(cmd)
+        }
+        "aider" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/aider", "aider"])?;
+            let mut cmd = Command::new(bin);
+            cmd.arg("--message")
+                .arg(prompt)
+                .arg("--yes-always")
+                .arg("--no-pretty")
+                .arg("--no-stream")
+                .arg("--no-check-update")
+                .arg("--model")
+                .arg(model);
+            Some(cmd)
+        }
+        "goose" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/goose", "goose"])?;
+            let mut cmd = Command::new(bin);
+            cmd.env("GOOSE_MODE", "auto")
+                .env("GOOSE_DISABLE_KEYRING", "1")
+                .arg("run")
+                .arg("--text")
+                .arg(prompt)
+                .arg("--no-session")
+                .arg("--quiet")
+                .arg("--model")
+                .arg(model);
+            Some(cmd)
+        }
+        "amp" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/amp", "amp"])?;
+            let mut cmd = Command::new(bin);
+            if let Some(key) = resolve_key(api_keys, "amp", &["AMP_API_KEY"]) {
+                if !key.is_empty() {
+                    cmd.env("AMP_API_KEY", key);
+                }
+            }
+            cmd.arg("-x")
+                .arg(prompt)
+                .arg("--dangerously-allow-all");
+            Some(cmd)
+        }
+        "droid" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/droid", "droid"])?;
+            let mut cmd = Command::new(bin);
+            if let Some(key) = resolve_key(api_keys, "droid", &["FACTORY_API_KEY"]) {
+                if !key.is_empty() {
+                    cmd.env("FACTORY_API_KEY", key);
+                }
+            }
+            cmd.arg("exec")
+                .arg("--auto")
+                .arg("high")
+                .arg("-m")
+                .arg(model)
+                .arg("--cwd")
+                .arg(work_dir)
+                .arg(prompt);
+            Some(cmd)
+        }
+        "qwen" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/qwen", "qwen"])?;
+            let mut cmd = Command::new(bin);
+            if let Some(key) =
+                resolve_key(api_keys, "qwen", &["DASHSCOPE_API_KEY", "QWEN_CODE_API_KEY"])
+            {
+                if !key.is_empty() {
+                    cmd.env("DASHSCOPE_API_KEY", key);
+                }
+            }
+            cmd.arg("-p")
+                .arg(prompt)
+                .arg("-m")
+                .arg(model)
+                .arg("--yolo");
+            Some(cmd)
+        }
+        "continue" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/cn", "cn"])?;
+            let mut cmd = Command::new(bin);
+            if let Some(key) = resolve_key(api_keys, "continue", &["CONTINUE_API_KEY"]) {
+                if !key.is_empty() {
+                    cmd.env("CONTINUE_API_KEY", key);
+                }
+            }
+            cmd.arg("-p")
+                .arg(prompt)
+                .arg("--allow")
+                .arg("*")
+                .arg("--silent")
+                .arg("--model")
+                .arg(model)
+                .arg("--cwd")
+                .arg(work_dir);
+            Some(cmd)
+        }
+        "cline" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/cline", "cline"])?;
+            let mut cmd = Command::new(bin);
+            cmd.arg("--auto-approve")
+                .arg("true")
+                .arg("-m")
+                .arg(model)
+                .arg("-c")
+                .arg(work_dir)
+                .arg(prompt);
+            Some(cmd)
+        }
+        "crush" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/crush", "crush"])?;
+            let mut cmd = Command::new(bin);
+            cmd.arg("run")
+                .arg("--cwd")
+                .arg(work_dir)
+                .arg("--yolo")
+                .arg("--quiet")
+                .arg(prompt);
+            Some(cmd)
+        }
+        "mistral" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/vibe", "vibe"])?;
+            let mut cmd = Command::new(bin);
+            if let Some(key) =
+                resolve_key(api_keys, "mistral", &["MISTRAL_API_KEY", "CODESTRAL_API_KEY"])
+            {
+                if !key.is_empty() {
+                    cmd.env("MISTRAL_API_KEY", key);
+                }
+            }
+            cmd.arg("-p").arg(prompt).arg("--auto-approve");
+            Some(cmd)
+        }
+        "ollama" => {
+            let bin = detect_binary(&["/opt/homebrew/bin/ollama", "/usr/local/bin/ollama", "ollama"])?;
+            let mut cmd = Command::new(bin);
+            cmd.arg("run").arg(model).arg(prompt);
+            Some(cmd)
+        }
+        _ => None,
     }
 }
 
@@ -2074,6 +3223,96 @@ fn synthesize_provider_perspective(
             "[Kimi • {}] Long-Context Cross-Repository Synthesis for `{}`:\n\
             • Full-repo correlation across `{}`.\n\
             • Proposal for \"{}\": Unify session history, subagent telemetry, and multi-provider consensus state into a single coherent timeline with instant context switching.",
+            model, project, file_list, clean_q
+        ),
+        "gemini" => format!(
+            "[Gemini CLI • {}] 1M-Context Multimodal & Grounded Architecture for `{}`:\n\
+            • Workspace Context: Indexed `{}` with MCP tool and search grounding.\n\
+            • Proposal for \"{}\": Leverage 1M-token full-repository context to align cross-module contracts, generate comprehensive test harnesses, and validate edge cases in a single pass.",
+            model, project, file_list, clean_q
+        ),
+        "cursor" => format!(
+            "[Cursor Agent • {}] Multi-File Composer & Codebase Indexing Synthesis for `{}`:\n\
+            • Indexed targets: `{}`.\n\
+            • Proposal for \"{}\": Apply coordinated multi-file structural edits with semantic AST awareness and automated lint/typecheck verification.",
+            model, project, file_list, clean_q
+        ),
+        "opencode" => format!(
+            "[OpenCode • {}] LSP-Guided Terminal Agent Architecture for `{}`:\n\
+            • Audited `{}` via LSP diagnostics.\n\
+            • Proposal for \"{}\": Combine multi-provider routing with live language-server symbol resolution to ensure zero broken references across module boundaries.",
+            model, project, file_list, clean_q
+        ),
+        "aider" => format!(
+            "[Aider • {}] Repo-Map & Architect/Editor Split Patch for `{}`:\n\
+            • Tree-sitter repo-map over `{}`.\n\
+            • Proposal for \"{}\": Separate high-level architectural reasoning from surgical unified-diff editing, followed by automatic git commit and test verification.",
+            model, project, file_list, clean_q
+        ),
+        "goose" => format!(
+            "[Block Goose • {}] Autonomous MCP Extension & Recipe Workflow for `{}`:\n\
+            • Scanned `{}`.\n\
+            • Proposal for \"{}\": Orchestrate modular MCP tool extensions and deterministic sub-recipes to automate build, test, and deployment verification.",
+            model, project, file_list, clean_q
+        ),
+        "amp" => format!(
+            "[Sourcegraph Amp • {}] Code-Graph & Deep Subagent Review for `{}`:\n\
+            • Cross-reference graph over `{}`.\n\
+            • Proposal for \"{}\": Dispatch parallel Oracle subagents to verify call-graph invariants and ensure zero regressions across dependent packages.",
+            model, project, file_list, clean_q
+        ),
+        "droid" => format!(
+            "[Factory Droid • {}] Enterprise Autonomy & CI/CD Remediation for `{}`:\n\
+            • Audited `{}`.\n\
+            • Proposal for \"{}\": Enforce enterprise security guardrails, deterministic build reproducibility, and automated PR verification gates.",
+            model, project, file_list, clean_q
+        ),
+        "qwen" => format!(
+            "[Qwen Code • {}] Polyglot Agentic Coding & Synthesis for `{}`:\n\
+            • Analyzed `{}`.\n\
+            • Proposal for \"{}\": Optimize data structures, concurrency primitives, and cross-language FFI/API contracts with high token efficiency.",
+            model, project, file_list, clean_q
+        ),
+        "continue" => format!(
+            "[Continue CLI • {}] Continuous AI Check & Rule Enforcement for `{}`:\n\
+            • Checked `{}` against workspace rules.\n\
+            • Proposal for \"{}\": Codify architectural invariants as repeatable headless checks that run both interactively and in CI pipelines.",
+            model, project, file_list, clean_q
+        ),
+        "cline" => format!(
+            "[Cline CLI • {}] Plan/Act Dual-Phase Execution for `{}`:\n\
+            • Mapped `{}`.\n\
+            • Proposal for \"{}\": Establish an explicit read-only architectural plan before executing sandboxed file mutations and shell verification.",
+            model, project, file_list, clean_q
+        ),
+        "crush" => format!(
+            "[Charm Crush • {}] Fast Terminal Session & LSP Synthesis for `{}`:\n\
+            • Inspected `{}`.\n\
+            • Proposal for \"{}\": Deliver clean, low-overhead implementation patches with immediate terminal feedback and zero bloat.",
+            model, project, file_list, clean_q
+        ),
+        "grok" => format!(
+            "[xAI Grok • {}] Real-Time Systems & Reasoning Analysis for `{}`:\n\
+            • Evaluated `{}`.\n\
+            • Proposal for \"{}\": Strip unnecessary abstraction layers, maximize I/O concurrency, and harden failure recovery paths under load.",
+            model, project, file_list, clean_q
+        ),
+        "mistral" => format!(
+            "[Mistral Codestral / Devstral • {}] Low-LatencySWE & Fill-in-the-Middle Synthesis for `{}`:\n\
+            • Scanned `{}`.\n\
+            • Proposal for \"{}\": Apply high-precision structural code generation with minimal latency and strict adherence to idiomatic compiler patterns.",
+            model, project, file_list, clean_q
+        ),
+        "ollama" => format!(
+            "[Local Ollama • {}] Air-Gapped Zero-Telemetry Local Inference for `{}`:\n\
+            • Local workspace `{}`.\n\
+            • Proposal for \"{}\": Execute 100% offline code synthesis and verification on local hardware with zero external network egress.",
+            model, project, file_list, clean_q
+        ),
+        "openrouter" => format!(
+            "[OpenRouter • {}] Unified Multi-Model Frontier Routing for `{}`:\n\
+            • Context across `{}`.\n\
+            • Proposal for \"{}\": Route specialized sub-tasks across the highest-performing frontier and open-weight coding models with automatic failover.",
             model, project, file_list, clean_q
         ),
         _ => format!(

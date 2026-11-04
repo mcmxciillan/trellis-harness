@@ -597,3 +597,168 @@ printf '{"schema_version":1,"stream":{"kind":"session","id":"muse-sess-01"},"seq
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn seam3_universal_cli_jsonl_dialects_and_23_agent_registry() {
+    let mut keys = HashMap::new();
+    keys.insert("gemini".to_string(), "AIza-test".to_string());
+    keys.insert("grok".to_string(), "xai-test".to_string());
+    keys.insert("mistral".to_string(), "mis-test".to_string());
+    keys.insert("openrouter".to_string(), "sk-or-test".to_string());
+
+    let reg = build_provider_registry(&keys);
+    assert_eq!(reg.len(), 23, "Trellis must register all 23 coding agents and providers");
+
+    let expected_ids = [
+        "antigravity",
+        "jev",
+        "gemini",
+        "muse",
+        "claude",
+        "codex",
+        "copilot",
+        "cursor",
+        "opencode",
+        "aider",
+        "goose",
+        "amp",
+        "droid",
+        "qwen",
+        "continue",
+        "cline",
+        "crush",
+        "deepseek",
+        "kimi",
+        "grok",
+        "mistral",
+        "ollama",
+        "openrouter",
+    ];
+    for id in expected_ids {
+        assert!(
+            reg.iter().any(|p| p.id == id),
+            "Provider registry missing expected agent/provider `{}`",
+            id
+        );
+    }
+
+    // 1. Claude Code / Amp stream-json dialect
+    let claude_init = r#"{"type":"system","subtype":"init","session_id":"claude-sess-99","model":"claude-sonnet-4-6"}"#;
+    assert_eq!(
+        parse_agy_stream_json_line(claude_init, "exo-suit"),
+        Some(AgyParsedEvent::Init {
+            conversation_id: "claude-sess-99".to_string()
+        })
+    );
+
+    let claude_assistant_tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"cargo test --lib"}}]}}"#;
+    match parse_agy_stream_json_line(claude_assistant_tool, "exo-suit") {
+        Some(AgyParsedEvent::ToolActive {
+            tool_name, summary, ..
+        }) => {
+            assert_eq!(tool_name, "run_command");
+            assert_eq!(summary, "cargo test --lib");
+        }
+        other => panic!("Expected ToolActive from Claude assistant tool_use, got {:?}", other),
+    }
+
+    let claude_result = r#"{"type":"result","subtype":"success","session_id":"claude-sess-99","result":"All 42 tests passed.","usage":{"input_tokens":1200,"output_tokens":85,"cache_read_input_tokens":400}}"#;
+    assert_eq!(
+        parse_agy_stream_json_line(claude_result, "exo-suit"),
+        Some(AgyParsedEvent::Result {
+            conversation_id: "claude-sess-99".to_string(),
+            response: "All 42 tests passed.".to_string(),
+            input_tokens: 1200,
+            output_tokens: 85,
+            cache_read_tokens: 400,
+        })
+    );
+
+    // 2. Gemini CLI / Qwen Code / Factory Droid stream-json dialect
+    let gemini_tool = r#"{"type":"tool_use","tool_name":"read_file","tool_id":"call_1","parameters":{"path":"src/providers.rs"}}"#;
+    match parse_agy_stream_json_line(gemini_tool, "exo-suit") {
+        Some(AgyParsedEvent::ToolActive {
+            tool_name, summary, ..
+        }) => {
+            assert_eq!(tool_name, "read_file");
+            assert_eq!(summary, "src/providers.rs");
+        }
+        other => panic!("Expected ToolActive from Gemini tool_use, got {:?}", other),
+    }
+
+    let gemini_res = r#"{"type":"result","status":"success","response":"Gemini 2.5 Pro synthesis complete.","stats":{"input_tokens":2048,"output_tokens":190,"cached":512}}"#;
+    assert_eq!(
+        parse_agy_stream_json_line(gemini_res, "exo-suit"),
+        Some(AgyParsedEvent::Result {
+            conversation_id: String::new(),
+            response: "Gemini 2.5 Pro synthesis complete.".to_string(),
+            input_tokens: 2048,
+            output_tokens: 190,
+            cache_read_tokens: 512,
+        })
+    );
+
+    // 3. OpenAI Codex CLI (--json) dialect
+    let codex_init = r#"{"type":"thread.started","thread_id":"thread_codex_77"}"#;
+    assert_eq!(
+        parse_agy_stream_json_line(codex_init, "exo-suit"),
+        Some(AgyParsedEvent::Init {
+            conversation_id: "thread_codex_77".to_string()
+        })
+    );
+
+    let codex_cmd = r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"cargo check","status":"in_progress"}}"#;
+    match parse_agy_stream_json_line(codex_cmd, "exo-suit") {
+        Some(AgyParsedEvent::ToolActive {
+            tool_name, summary, ..
+        }) => {
+            assert_eq!(tool_name, "run_command");
+            assert_eq!(summary, "cargo check");
+        }
+        other => panic!("Expected ToolActive from Codex item.started, got {:?}", other),
+    }
+
+    let codex_msg = r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Codex patch applied cleanly."}}"#;
+    match parse_agy_stream_json_line(codex_msg, "exo-suit") {
+        Some(AgyParsedEvent::TextDelta { delta, .. }) => {
+            assert_eq!(delta, "Codex patch applied cleanly.");
+        }
+        other => panic!("Expected TextDelta from Codex agent_message, got {:?}", other),
+    }
+
+    // 4. GitHub Copilot CLI (--output-format json) dialect
+    let copilot_tool = r#"{"type":"tool.execution_start","data":{"toolName":"bash","arguments":{"command":"git status -sb"}}}"#;
+    match parse_agy_stream_json_line(copilot_tool, "exo-suit") {
+        Some(AgyParsedEvent::ToolActive {
+            tool_name, summary, ..
+        }) => {
+            assert_eq!(tool_name, "run_command");
+            assert_eq!(summary, "git status -sb");
+        }
+        other => panic!("Expected ToolActive from Copilot tool.execution_start, got {:?}", other),
+    }
+
+    // 5. OpenCode (run --format json) dialect
+    let opencode_tool = r#"{"type":"tool_use","sessionID":"ses_open_1","part":{"type":"tool","tool":"edit","state":{"status":"completed","input":{"filePath":"src/lib.rs"}}}}"#;
+    match parse_agy_stream_json_line(opencode_tool, "exo-suit") {
+        Some(AgyParsedEvent::ToolActive {
+            tool_name, summary, ..
+        }) => {
+            assert_eq!(tool_name, "edit_file");
+            assert_eq!(summary, "src/lib.rs");
+        }
+        other => panic!("Expected ToolActive from OpenCode tool_use, got {:?}", other),
+    }
+
+    // 6. Cursor Agent CLI (--output-format stream-json) tool_call dialect
+    let cursor_tool = r#"{"type":"tool_call","subtype":"started","call_id":"call_9","tool_call":{"readToolCall":{"args":{"path":"README.md"}}}}"#;
+    match parse_agy_stream_json_line(cursor_tool, "exo-suit") {
+        Some(AgyParsedEvent::ToolActive {
+            tool_name, summary, ..
+        }) => {
+            assert_eq!(tool_name, "read_file");
+            assert_eq!(summary, "README.md");
+        }
+        other => panic!("Expected ToolActive from Cursor tool_call, got {:?}", other),
+    }
+}
